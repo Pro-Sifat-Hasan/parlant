@@ -470,12 +470,43 @@ Please set OPENAI_API_KEY in your environment before running Parlant.
 
     @override
     async def get_schematic_generator(self, t: type[T]) -> OpenAISchematicGenerator[T]:
+<<<<<<< Updated upstream
         return {
             SingleToolBatchSchema: GPT_4o[SingleToolBatchSchema],
             JourneyNodeSelectionSchema: GPT_4_1[JourneyNodeSelectionSchema],
             CannedResponseDraftSchema: GPT_4_1[CannedResponseDraftSchema],
             CannedResponseSelectionSchema: GPT_4_1[CannedResponseSelectionSchema],
         }.get(t, GPT_4o_24_08_06[t])(self._logger)  # type: ignore
+=======
+        if self._generative_model_name:
+            # If specific model(s) requested, use them with fallback support
+            model_names = (
+                self._generative_model_name
+                if isinstance(self._generative_model_name, list)
+                else [self._generative_model_name]
+            )
+            
+            generators = []
+            for model_name in model_names:
+                generator_class = self._get_generator_class_for_model(model_name)
+                generators.append(generator_class[t](self._logger))  # type: ignore
+            
+            if len(generators) == 1:
+                return generators[0]
+            else:
+                return FallbackSchematicGenerator[t](  # type: ignore
+                    *generators,
+                    logger=self._logger,
+                )
+        else:
+            # Default behavior with schema-specific model selection
+            return {
+                SingleToolBatchSchema: GPT_4o_Mini[SingleToolBatchSchema],
+                JourneyNodeSelectionSchema: GPT_4o_Mini[JourneyNodeSelectionSchema],
+                CannedResponseDraftSchema: GPT_4o_Mini[CannedResponseDraftSchema],
+                CannedResponseSelectionSchema: GPT_4o_Mini[CannedResponseSelectionSchema],
+            }.get(t, GPT_4o_Mini[t])(self._logger)  # type: ignore
+>>>>>>> Stashed changes
 
     @override
     async def get_embedder(self) -> Embedder:

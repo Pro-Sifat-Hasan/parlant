@@ -256,10 +256,22 @@ class NLPServices:
         """Creates an OpenAI NLPService instance using the provided container."""
         from parlant.adapters.nlp.openai_service import OpenAIService
 
+<<<<<<< Updated upstream
         if error := OpenAIService.verify_environment():
             raise SDKError(error)
 
         return OpenAIService(container[Logger])
+=======
+        def factory(c: Container) -> NLPService:
+            if error := OpenAIService.verify_environment():
+                raise SDKError(error)
+                return OpenAIService(c[Logger], generative_model_name=generative_model_name)
+
+            if container is not None:
+                return factory(container)
+
+            return factory
+>>>>>>> Stashed changes
 
     @staticmethod
     def anthropic(container: Container) -> NLPService:

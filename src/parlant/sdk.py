@@ -271,6 +271,9 @@ class NLPServices:
                 return factory(container)
 
             return factory
+<<<<<<< Updated upstream
+>>>>>>> Stashed changes
+=======
 >>>>>>> Stashed changes
 
     @staticmethod

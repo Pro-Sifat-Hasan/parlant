@@ -506,6 +506,9 @@ Please set OPENAI_API_KEY in your environment before running Parlant.
                 CannedResponseDraftSchema: GPT_4o_Mini[CannedResponseDraftSchema],
                 CannedResponseSelectionSchema: GPT_4o_Mini[CannedResponseSelectionSchema],
             }.get(t, GPT_4o_Mini[t])(self._logger)  # type: ignore
+<<<<<<< Updated upstream
+>>>>>>> Stashed changes
+=======
 >>>>>>> Stashed changes
 
     @override

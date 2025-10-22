@@ -252,29 +252,24 @@ class NLPServices:
         return AzureService(container[Logger])
 
     @staticmethod
-    def openai(container: Container) -> NLPService:
-        """Creates an OpenAI NLPService instance using the provided container."""
+    def openai(container: Container | None = None, generative_model_name: str | list[str] | None = None) -> NLPService | Callable[[Container], NLPService]:
+        """
+        Returns a callable that creates an OpenAI NLPService instance using the provided container and generative_model_name.
+        
+        If generative_model_name is None, the default model selection behavior is used.
+        """
         from parlant.adapters.nlp.openai_service import OpenAIService
 
-<<<<<<< Updated upstream
-        if error := OpenAIService.verify_environment():
-            raise SDKError(error)
-
-        return OpenAIService(container[Logger])
-=======
         def factory(c: Container) -> NLPService:
             if error := OpenAIService.verify_environment():
                 raise SDKError(error)
-                return OpenAIService(c[Logger], generative_model_name=generative_model_name)
+            
+            return OpenAIService(c[Logger], generative_model_name=generative_model_name)
 
-            if container is not None:
-                return factory(container)
+        if container is not None:
+            return factory(container)
 
-            return factory
-<<<<<<< Updated upstream
->>>>>>> Stashed changes
-=======
->>>>>>> Stashed changes
+        return factory
 
     @staticmethod
     def anthropic(container: Container) -> NLPService:

@@ -17,7 +17,7 @@ import inspect
 import os
 import time
 import types
-from google.api_core.exceptions import NotFound, TooManyRequests, ResourceExhausted, ServerError
+from google.api_core.exceptions import NotFound, TooManyRequests, ResourceExhausted, ServerError  # type: ignore
 import google.genai  # type: ignore
 import google.genai.types  # type: ignore
 from collections.abc import Mapping as MappingABC, Sequence as SequenceABC
@@ -27,7 +27,15 @@ from pydantic import BaseModel, Field, ValidationError
 from pydantic.fields import FieldInfo
 
 from parlant.core.common import DefaultBaseModel
+from parlant.core.engines.alpha.canned_response_generator import (
+    CannedResponseDraftSchema,
+    CannedResponseSelectionSchema,
+)
+from parlant.core.engines.alpha.guideline_matching.generic.journey_node_selection_batch import (
+    JourneyNodeSelectionSchema,
+)
 from parlant.core.engines.alpha.prompt_builder import PromptBuilder
+from parlant.core.engines.alpha.tool_calling.single_tool_batch import SingleToolBatchSchema
 from parlant.core.nlp.policies import policy, retry
 from parlant.core.nlp.tokenization import EstimatingTokenizer
 from parlant.core.nlp.moderation import ModerationService, NoModeration
@@ -409,17 +417,57 @@ Please set GEMINI_API_KEY in your environment before running Parlant.
     def __init__(
         self,
         logger: Logger,
+        generative_model_name: str | list[str] | None = None,
     ) -> None:
         self._logger = logger
+        self._generative_model_name = generative_model_name
         self._logger.info("Initialized GeminiService")
+
+    def _get_generator_class_for_model(self, model_name: str):
+        """Returns the appropriate generator class for the given model name."""
+        model_mapping = {
+            "gemini-1.5-flash": Gemini_1_5_Flash,
+            "gemini-2.0-flash": Gemini_2_0_Flash,
+            "gemini-2.0-flash-lite-preview-02-05": Gemini_2_0_Flash_Lite,
+            "gemini-1.5-pro": Gemini_1_5_Pro,
+            "gemini-2.5-flash": Gemini_2_5_Flash,
+            "gemini-2.5-pro": Gemini_2_5_Pro,
+        }
+        
+        # Check if it's a known model
+        if model_name in model_mapping:
+            return model_mapping[model_name]
+        else:
+            # For unknown models, create a dynamic generator
+            self._logger.warning(
+                f"Unrecognized model name '{model_name}'. Using Gemini_2_5_Flash as fallback."
+            )
+            return Gemini_2_5_Flash
 
     @override
     async def get_schematic_generator(self, t: type[T]) -> GeminiSchematicGenerator[T]:
-        return FallbackSchematicGenerator[t](  # type: ignore
-            Gemini_2_5_Flash[t](self._logger),  # type: ignore
-            Gemini_2_5_Pro[t](self._logger),  # type: ignore
-            logger=self._logger,
-        )
+        if self._generative_model_name:
+            # If specific model(s) requested, use the first one (simple approach)
+            model_name = (
+                self._generative_model_name[0] 
+                if isinstance(self._generative_model_name, list) 
+                else self._generative_model_name
+            )
+            generator_class = self._get_generator_class_for_model(model_name)
+            # Use the same schema-specific mapping structure with the custom model
+            return {
+                SingleToolBatchSchema: generator_class[SingleToolBatchSchema],
+                JourneyNodeSelectionSchema: generator_class[JourneyNodeSelectionSchema],
+                CannedResponseDraftSchema: generator_class[CannedResponseDraftSchema],
+                CannedResponseSelectionSchema: generator_class[CannedResponseSelectionSchema],
+            }.get(t, generator_class[t])(self._logger)  # type: ignore
+        else:
+            # Default behavior - use fallback with Gemini_2_5_Flash and Gemini_2_5_Pro
+            return FallbackSchematicGenerator[t](  # type: ignore
+                Gemini_2_5_Flash[t](self._logger),  # type: ignore
+                Gemini_2_5_Pro[t](self._logger),  # type: ignore
+                logger=self._logger,
+            )
 
     @override
     async def get_embedder(self) -> Embedder:

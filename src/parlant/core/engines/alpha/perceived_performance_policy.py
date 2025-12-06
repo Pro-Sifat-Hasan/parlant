@@ -18,7 +18,8 @@ import random
 from typing import cast
 from typing_extensions import override
 
-from parlant.core.engines.alpha.loaded_context import LoadedContext
+from parlant.core.agents import AgentId
+from parlant.core.engines.alpha.engine_context import EngineContext
 from parlant.core.sessions import EventKind, EventSource, MessageEventData
 from parlant.core.tags import Tag
 
@@ -29,7 +30,7 @@ class PerceivedPerformancePolicy(ABC):
     @abstractmethod
     async def get_processing_indicator_delay(
         self,
-        context: LoadedContext | None = None,
+        context: EngineContext | None = None,
     ) -> float:
         """
         Returns the delay before the indicator (agent is thinking...) is sent.
@@ -42,7 +43,7 @@ class PerceivedPerformancePolicy(ABC):
     @abstractmethod
     async def get_extended_processing_indicator_delay(
         self,
-        context: LoadedContext | None = None,
+        context: EngineContext | None = None,
     ) -> float:
         """
         Returns the delay before the indicator (agent is thinking "hard"...) is sent.
@@ -55,7 +56,7 @@ class PerceivedPerformancePolicy(ABC):
     @abstractmethod
     async def get_follow_up_delay(
         self,
-        context: LoadedContext | None = None,
+        context: EngineContext | None = None,
     ) -> float:
         """
         Returns the delay before a follow-up message is sent.
@@ -68,7 +69,7 @@ class PerceivedPerformancePolicy(ABC):
     @abstractmethod
     async def get_preamble_delay(
         self,
-        context: LoadedContext | None = None,
+        context: EngineContext | None = None,
     ) -> float:
         """
         Returns the delay before the preamble message is sent.
@@ -81,13 +82,27 @@ class PerceivedPerformancePolicy(ABC):
     @abstractmethod
     async def is_preamble_required(
         self,
-        context: LoadedContext | None = None,
+        context: EngineContext | None = None,
     ) -> bool:
         """
         Determines if a preamble message is required for the given context.
 
         :param context: The loaded context containing session and interaction details.
         :return: True if a preamble is required, False otherwise.
+        """
+        ...
+
+    @abstractmethod
+    async def is_message_splitting_required(
+        self,
+        context: EngineContext,
+        message: str,
+    ) -> bool:
+        """
+        Determines if messages should be split into multiple parts.
+
+        :param context: The loaded context containing session and interaction details.
+        :return: True if message splitting is required, False otherwise.
         """
         ...
 
@@ -98,35 +113,35 @@ class BasicPerceivedPerformancePolicy(PerceivedPerformancePolicy):
     @override
     async def get_processing_indicator_delay(
         self,
-        context: LoadedContext | None = None,
+        context: EngineContext | None = None,
     ) -> float:
         return random.uniform(1.0, 2.0)
 
     @override
     async def get_extended_processing_indicator_delay(
         self,
-        context: LoadedContext | None = None,
+        context: EngineContext | None = None,
     ) -> float:
         return random.uniform(3.5, 5.0)
 
     @override
     async def get_follow_up_delay(
         self,
-        context: LoadedContext | None = None,
+        context: EngineContext | None = None,
     ) -> float:
         return random.uniform(0.5, 1.5)
 
     @override
     async def get_preamble_delay(
         self,
-        context: LoadedContext | None = None,
+        context: EngineContext | None = None,
     ) -> float:
         return random.uniform(1.5, 2.0)
 
     @override
     async def is_preamble_required(
         self,
-        context: LoadedContext | None = None,
+        context: EngineContext | None = None,
     ) -> bool:
         if context is None:
             return False
@@ -151,7 +166,15 @@ class BasicPerceivedPerformancePolicy(PerceivedPerformancePolicy):
 
         return False
 
-    def _last_agent_message_is_preamble(self, context: LoadedContext) -> bool:
+    @override
+    async def is_message_splitting_required(
+        self,
+        context: EngineContext,
+        message: str,
+    ) -> bool:
+        return True
+
+    def _last_agent_message_is_preamble(self, context: EngineContext) -> bool:
         last_agent_message = next(
             (
                 e
@@ -168,7 +191,7 @@ class BasicPerceivedPerformancePolicy(PerceivedPerformancePolicy):
 
         return Tag.preamble() in message_data.get("tags", [])
 
-    def _calculate_previous_customer_wait_times(self, context: LoadedContext) -> list[float]:
+    def _calculate_previous_customer_wait_times(self, context: EngineContext) -> list[float]:
         result = []
 
         message_events = [e for e in context.interaction.history if e.kind == EventKind.MESSAGE]
@@ -196,35 +219,43 @@ class NullPerceivedPerformancePolicy(PerceivedPerformancePolicy):
     @override
     async def get_processing_indicator_delay(
         self,
-        context: LoadedContext | None = None,
+        context: EngineContext | None = None,
     ) -> float:
         return 0
 
     @override
     async def get_extended_processing_indicator_delay(
         self,
-        context: LoadedContext | None = None,
+        context: EngineContext | None = None,
     ) -> float:
         return math.inf
 
     @override
     async def get_follow_up_delay(
         self,
-        context: LoadedContext | None = None,
+        context: EngineContext | None = None,
     ) -> float:
         return 0
 
     @override
     async def get_preamble_delay(
         self,
-        context: LoadedContext | None = None,
+        context: EngineContext | None = None,
     ) -> float:
         return 0
 
     @override
     async def is_preamble_required(
         self,
-        context: LoadedContext | None = None,
+        context: EngineContext | None = None,
+    ) -> bool:
+        return False
+
+    @override
+    async def is_message_splitting_required(
+        self,
+        context: EngineContext,
+        message: str,
     ) -> bool:
         return False
 
@@ -233,6 +264,32 @@ class VoiceOptimizedPerceivedPerformancePolicy(NullPerceivedPerformancePolicy):
     @override
     async def is_preamble_required(
         self,
-        context: LoadedContext | None = None,
+        context: EngineContext | None = None,
     ) -> bool:
         return True
+
+
+class PerceivedPerformancePolicyProvider:
+    """Provides perceived performance policies on a per-agent basis."""
+
+    def __init__(self, default_policy: PerceivedPerformancePolicy) -> None:
+        self._default_policy: PerceivedPerformancePolicy = default_policy
+        self._agent_policies: dict[AgentId, PerceivedPerformancePolicy] = {}
+
+    def get_policy(self, agent_id: AgentId) -> PerceivedPerformancePolicy:
+        """
+        Returns the perceived performance policy for the given agent.
+
+        :param agent_id: The ID of the agent.
+        :return: The perceived performance policy for the agent, or the default policy if none is set.
+        """
+        return self._agent_policies.get(agent_id, self._default_policy)
+
+    def set_policy(self, agent_id: AgentId, policy: PerceivedPerformancePolicy) -> None:
+        """
+        Sets the perceived performance policy for the given agent.
+
+        :param agent_id: The ID of the agent.
+        :param policy: The perceived performance policy to set.
+        """
+        self._agent_policies[agent_id] = policy

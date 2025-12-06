@@ -13,18 +13,21 @@
 # limitations under the License.
 
 from __future__ import annotations
+
 from ast import literal_eval
 from datetime import datetime, timezone
 from mailbox import FormatError
+from mcp.types import Tool as McpTool
 from types import TracebackType
 from typing import Any, Sequence, Mapping, Optional, Literal, Callable
-from fastmcp.client.transports import StreamableHttpTransport
 from typing_extensions import override
+import asyncio
+
 from fastmcp import FastMCP
 from fastmcp.tools import Tool as FastMCPTool
 from fastmcp.client import Client
-from mcp.types import Tool as McpTool
-import asyncio
+from fastmcp.client.transports import StreamableHttpTransport
+
 from parlant.core.loggers import Logger
 from parlant.core.tools import (
     Tool,
@@ -38,7 +41,7 @@ from parlant.core.tools import (
     ToolParameterType,
 )
 from parlant.core.common import JSONSerializable
-from parlant.core.contextual_correlator import ContextualCorrelator
+from parlant.core.tracer import Tracer
 from parlant.core.emissions import EventEmitterFactory
 
 DEFAULT_MCP_PORT: int = 8181
@@ -127,12 +130,12 @@ class MCPToolClient(ToolService):
         url: str,
         event_emitter_factory: EventEmitterFactory,
         logger: Logger,
-        correlator: ContextualCorrelator,
+        tracer: Tracer,
         port: int = DEFAULT_MCP_PORT,
     ) -> None:
         self._event_emitter_factory = event_emitter_factory
         self._logger = logger
-        self._correlator = correlator
+        self._tracer = tracer
         if ":" in url[-6:]:
             parts = url.split(":")
             self.url = ":".join(parts[:-1])

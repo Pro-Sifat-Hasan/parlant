@@ -16,8 +16,8 @@ from abc import abstractmethod
 from dataclasses import dataclass
 from typing import Mapping, Optional, Sequence
 
-from parlant.core.common import CancellationSuppressionLatch
-from parlant.core.engines.alpha.loaded_context import LoadedContext
+from parlant.core.async_utils import CancellationSuppressionLatch
+from parlant.core.engines.alpha.engine_context import EngineContext
 from parlant.core.emissions import EmittedEvent
 from parlant.core.nlp.generation_info import GenerationInfo
 
@@ -37,12 +37,12 @@ class MessageEventComposer:
     @abstractmethod
     async def generate_preamble(
         self,
-        context: LoadedContext,
+        context: EngineContext,
     ) -> Sequence[MessageEventComposition]: ...
 
     @abstractmethod
     async def generate_response(
         self,
-        context: LoadedContext,
-        latch: Optional[CancellationSuppressionLatch] = None,
+        context: EngineContext,
+        latch: Optional[CancellationSuppressionLatch[None]] = None,
     ) -> Sequence[MessageEventComposition]: ...

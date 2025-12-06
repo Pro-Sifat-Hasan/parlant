@@ -30,7 +30,7 @@ interface Props {
 
 export const DeleteDialog = ({session, closeDialog, deleteClicked}: {session: SessionInterface; closeDialog: () => void; deleteClicked: (e: React.MouseEvent) => Promise<void> | undefined}) => (
 	<div data-testid='deleteDialogContent'>
-		<SessionListItem session={session} disabled />
+		<SessionListItem session={session} disabled className='[&_.title]:max-w-[90%]' />
 		<div className='h-[80px] flex items-center justify-end pe-[18px]'>
 			<Button data-testid='cancel-delete' onClick={closeDialog} className='h-[46px] w-[96px] !bg-white text-[#656565] hover:text-[#151515] rounded-[6px] py-[12px] px-[24px] me-[10px] text-[16px] font-normal border'>
 				Cancel
@@ -129,19 +129,19 @@ export default function SessionListItem({session, isSelected, refetch, editingTi
 			if (messages?.length) {
 				messages.forEach((message) => {
 					exportData.push({
-						'Correlation ID': message.correlation_id,
+						'Trace ID': message.trace_id,
 						Source: message.source === 'ai_agent' ? 'AI Agent' : 'Customer',
 						Participant: message?.data?.participant?.display_name || '',
 						Timestamp: message.creation_utc || '',
 						Message: message.data?.message || '',
 						Draft: message.data?.draft || '',
 						Tags: message.data?.tags || '',
-						Flag: flaggedItems?.[message.correlation_id] || '',
+						Flag: flaggedItems?.[message.trace_id] || '',
 					});
 				});
 			}
 
-			const headers = ['Correlation ID', 'Source', 'Participant', 'Timestamp', 'Message', 'Draft', 'Tags', 'Flag'];
+			const headers = ['Trace ID', 'Source', 'Participant', 'Timestamp', 'Message', 'Draft', 'Tags', 'Flag'];
 
 			const filename = `session_${session.id}_"${session.title.replace(/[^a-zA-Z0-9]/g, '_')}.csv`;
 
@@ -249,7 +249,7 @@ export default function SessionListItem({session, isSelected, refetch, editingTi
 					isDeleting ? 'opacity-[33%]' : '',
 					className
 				)}>
-				<div className='flex-1 whitespace-nowrap flex overflow-hidden max-w-[210px] ms-[4px] h-[48px]'>
+				<div className='title flex-1 whitespace-nowrap flex overflow-hidden max-w-[210px] ms-[4px] h-[48px]'>
 					{editingTitle !== session.id && (
 						<div className='overflow-visible overflow-ellipsis flex items-center'>
 							<div>

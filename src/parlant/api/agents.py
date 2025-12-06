@@ -49,7 +49,6 @@ AgentNameField: TypeAlias = Annotated[
 AgentDescriptionField: TypeAlias = Annotated[
     str,
     Field(
-        default=None,
         description="Detailed description of the agent's purpose and capabilities",
         examples=["Technical Support Assistant"],
     ),
@@ -58,7 +57,6 @@ AgentDescriptionField: TypeAlias = Annotated[
 AgentMaxEngineIterationsField: TypeAlias = Annotated[
     int,
     Field(
-        default=1,
         description="Maximum number of processing iterations the agent can perform per request",
         ge=1,
         examples=[1, 3],
@@ -68,7 +66,6 @@ AgentMaxEngineIterationsField: TypeAlias = Annotated[
 AgentTagsField: TypeAlias = Annotated[
     list[TagId],
     Field(
-        default=None,
         description="List of tag IDs associated with the agent",
         examples=[["tag1", "tag2"]],
     ),
@@ -77,7 +74,6 @@ AgentTagsField: TypeAlias = Annotated[
 AgentTagUpdateAddField: TypeAlias = Annotated[
     list[TagId],
     Field(
-        default=None,
         description="List of tag IDs to add to the agent",
         examples=[["tag1", "tag2"]],
     ),
@@ -86,7 +82,6 @@ AgentTagUpdateAddField: TypeAlias = Annotated[
 AgentTagUpdateRemoveField: TypeAlias = Annotated[
     list[TagId],
     Field(
-        default=None,
         description="List of tag IDs to remove from the agent",
         examples=[["tag1", "tag2"]],
     ),
@@ -135,9 +130,9 @@ class AgentDTO(
     id: AgentIdPath
     name: AgentNameField
     description: AgentDescriptionField | None = None
-    max_engine_iterations: AgentMaxEngineIterationsField
+    max_engine_iterations: AgentMaxEngineIterationsField = 1
     composition_mode: CompositionModeDTO
-    tags: AgentTagsField
+    tags: AgentTagsField = []
 
 
 agent_creation_params_example: ExampleJson = {
@@ -157,13 +152,19 @@ class AgentCreationParamsDTO(
     Parameters for creating a new agent.
 
     Optional fields:
+    - `id`: Custom identifier for the agent. If not provided, an ID will be automatically generated.
+      Custom IDs can be any string format and are useful for maintaining consistent identifiers
+      across deployments or integrations.
     - `description`: Detailed explanation of the agent's purpose
     - `max_engine_iterations`: Processing limit per request
+    - `composition_mode`: How the agent composes responses
+    - `tags`: List of tag IDs to associate with the agent
 
     Note: Agents must be created via the API before they can be used.
     """
 
     name: AgentNameField
+    id: AgentIdPath | None = None
     description: AgentDescriptionField | None = None
     max_engine_iterations: AgentMaxEngineIterationsField | None = None
     composition_mode: CompositionModeDTO | None = None
@@ -262,7 +263,7 @@ def create_router(
                 "description": "Agent successfully created. Returns the complete agent object including generated ID.",
                 "content": example_json_content(agent_example),
             },
-            status.HTTP_422_UNPROCESSABLE_ENTITY: {
+            status.HTTP_422_UNPROCESSABLE_CONTENT: {
                 "description": "Validation error in request parameters"
             },
         },
@@ -276,10 +277,11 @@ def create_router(
         Creates a new agent in the system.
 
         The agent will be initialized with the provided name and optional settings.
-        A unique identifier will be automatically generated.
+        A unique identifier will be automatically generated unless a custom ID is provided.
 
         Default behaviors:
         - `name` defaults to `"Unnamed Agent"` if not provided
+        - `id` is auto-generated if not provided
         - `description` defaults to `None`
         - `max_engine_iterations` defaults to `None` (uses system default)
         """
@@ -296,6 +298,7 @@ def create_router(
             if params and params.composition_mode
             else None,
             tags=params.tags,
+            id=params.id if params else None,
         )
 
         return AgentDTO(
@@ -403,7 +406,7 @@ def create_router(
             status.HTTP_404_NOT_FOUND: {
                 "description": "Agent not found. the specified `agent_id` does not exist"
             },
-            status.HTTP_422_UNPROCESSABLE_ENTITY: {
+            status.HTTP_422_UNPROCESSABLE_CONTENT: {
                 "description": "Validation error in update parameters"
             },
         },

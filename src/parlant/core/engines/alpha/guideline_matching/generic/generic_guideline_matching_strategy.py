@@ -20,7 +20,7 @@ from typing import Mapping, Optional, Sequence, cast
 from typing_extensions import override
 
 from parlant.core import async_utils
-from parlant.core.common import JSONSerializable, generate_id
+from parlant.core.common import Criticality, JSONSerializable, generate_id
 from parlant.core.engines.alpha.guideline_matching.generic.common import internal_representation
 from parlant.core.engines.alpha.guideline_matching.generic.disambiguation_batch import (
     DisambiguationGuidelineMatchesSchema,
@@ -54,14 +54,17 @@ from parlant.core.engines.alpha.guideline_matching.guideline_match import Guidel
 from parlant.core.engines.alpha.guideline_matching.guideline_matcher import (
     GuidelineMatchingBatch,
     GuidelineMatchingStrategy,
-    GuidelineMatchingContext,
     ResponseAnalysisContext,
+)
+from parlant.core.engines.alpha.guideline_matching.guideline_matching_context import (
+    GuidelineMatchingContext,
 )
 from parlant.core.engines.alpha.optimization_policy import OptimizationPolicy
 from parlant.core.entity_cq import EntityQueries
 from parlant.core.guidelines import Guideline, GuidelineContent, GuidelineId, GuidelineStore
 from parlant.core.journeys import Journey, JourneyId, JourneyStore
 from parlant.core.loggers import Logger
+from parlant.core.meter import Meter
 from parlant.core.nlp.generation import SchematicGenerator
 from parlant.core.relationships import RelationshipKind, RelationshipStore
 
@@ -70,6 +73,7 @@ class GenericGuidelineMatchingStrategy(GuidelineMatchingStrategy):
     def __init__(
         self,
         logger: Logger,
+        meter: Meter,
         optimization_policy: OptimizationPolicy,
         guideline_store: GuidelineStore,
         journey_store: JourneyStore,
@@ -94,6 +98,7 @@ class GenericGuidelineMatchingStrategy(GuidelineMatchingStrategy):
         response_analysis_schematic_generator: SchematicGenerator[GenericResponseAnalysisSchema],
     ) -> None:
         self._logger = logger
+        self._meter = meter
 
         self._guideline_store = guideline_store
         self._journey_store = journey_store
@@ -204,6 +209,8 @@ class GenericGuidelineMatchingStrategy(GuidelineMatchingStrategy):
                     *[
                         self._create_batch_journey_step_selection(examined_journey, steps, context)
                         for examined_journey, steps in journey_step_selection_journeys.items()
+                        if len(steps)
+                        > 1  # In case journey has only one (root) step, no need to evaluate
                     ]
                 )
             )
@@ -222,6 +229,7 @@ class GenericGuidelineMatchingStrategy(GuidelineMatchingStrategy):
         return [
             GenericResponseAnalysisBatch(
                 logger=self._logger,
+                meter=self._meter,
                 optimization_policy=self._optimization_policy,
                 schematic_generator=self._response_analysis_schematic_generator,
                 context=context,
@@ -262,6 +270,7 @@ class GenericGuidelineMatchingStrategy(GuidelineMatchingStrategy):
                                     ],
                                 ),
                             ),
+                            criticality=Criticality.MEDIUM,
                             enabled=True,
                             tags=[],
                             metadata={},
@@ -291,7 +300,9 @@ class GenericGuidelineMatchingStrategy(GuidelineMatchingStrategy):
         batches = []
 
         guidelines_dict = {g.id: g for g in guidelines}
-        batch_size = self._get_optimal_batch_size(guidelines_dict)
+        batch_size = self._get_optimal_batch_size(
+            guidelines_dict, GenericObservationalGuidelineMatchingBatch
+        )
         guidelines_list = list(guidelines_dict.items())
         batch_count = math.ceil(len(guidelines_dict) / batch_size)
 
@@ -328,6 +339,7 @@ class GenericGuidelineMatchingStrategy(GuidelineMatchingStrategy):
     ) -> GenericObservationalGuidelineMatchingBatch:
         return GenericObservationalGuidelineMatchingBatch(
             logger=self._logger,
+            meter=self._meter,
             optimization_policy=self._optimization_policy,
             schematic_generator=self._observational_guideline_schematic_generator,
             guidelines=guidelines,
@@ -350,7 +362,9 @@ class GenericGuidelineMatchingStrategy(GuidelineMatchingStrategy):
         batches = []
 
         guidelines_dict = {g.id: g for g in guidelines}
-        batch_size = self._get_optimal_batch_size(guidelines_dict)
+        batch_size = self._get_optimal_batch_size(
+            guidelines_dict, GenericPreviouslyAppliedActionableGuidelineMatchingBatch
+        )
         guidelines_list = list(guidelines_dict.items())
         batch_count = math.ceil(len(guidelines_dict) / batch_size)
 
@@ -387,6 +401,7 @@ class GenericGuidelineMatchingStrategy(GuidelineMatchingStrategy):
     ) -> GenericPreviouslyAppliedActionableGuidelineMatchingBatch:
         return GenericPreviouslyAppliedActionableGuidelineMatchingBatch(
             logger=self._logger,
+            meter=self._meter,
             optimization_policy=self._optimization_policy,
             schematic_generator=self._previously_applied_actionable_guideline_schematic_generator,
             guidelines=guidelines,
@@ -409,7 +424,10 @@ class GenericGuidelineMatchingStrategy(GuidelineMatchingStrategy):
         batches = []
 
         guidelines_dict = {g.id: g for g in guidelines}
-        batch_size = self._get_optimal_batch_size(guidelines_dict)
+        batch_size = self._get_optimal_batch_size(
+            guidelines_dict,
+            GenericPreviouslyAppliedActionableCustomerDependentGuidelineMatchingBatch,
+        )
         guidelines_list = list(guidelines_dict.items())
         batch_count = math.ceil(len(guidelines_dict) / batch_size)
 
@@ -446,6 +464,7 @@ class GenericGuidelineMatchingStrategy(GuidelineMatchingStrategy):
     ) -> GenericPreviouslyAppliedActionableCustomerDependentGuidelineMatchingBatch:
         return GenericPreviouslyAppliedActionableCustomerDependentGuidelineMatchingBatch(
             logger=self._logger,
+            meter=self._meter,
             optimization_policy=self._optimization_policy,
             schematic_generator=self._previously_applied_actionable_customer_dependent_guideline_schematic_generator,
             guidelines=guidelines,
@@ -468,7 +487,9 @@ class GenericGuidelineMatchingStrategy(GuidelineMatchingStrategy):
         batches = []
 
         guidelines_dict = {g.id: g for g in guidelines}
-        batch_size = self._get_optimal_batch_size(guidelines_dict)
+        batch_size = self._get_optimal_batch_size(
+            guidelines_dict, GenericActionableGuidelineMatchingBatch
+        )
         guidelines_list = list(guidelines_dict.items())
         batch_count = math.ceil(len(guidelines_dict) / batch_size)
 
@@ -505,6 +526,7 @@ class GenericGuidelineMatchingStrategy(GuidelineMatchingStrategy):
     ) -> GenericActionableGuidelineMatchingBatch:
         return GenericActionableGuidelineMatchingBatch(
             logger=self._logger,
+            meter=self._meter,
             optimization_policy=self._optimization_policy,
             schematic_generator=self._actionable_guideline_schematic_generator,
             guidelines=guidelines,
@@ -545,6 +567,7 @@ class GenericGuidelineMatchingStrategy(GuidelineMatchingStrategy):
 
         return GenericDisambiguationGuidelineMatchingBatch(
             logger=self._logger,
+            meter=self._meter,
             journey_store=self._journey_store,
             optimization_policy=self._optimization_policy,
             schematic_generator=self._disambiguation_guidelines_schematic_generator,
@@ -572,6 +595,7 @@ class GenericGuidelineMatchingStrategy(GuidelineMatchingStrategy):
     ) -> GenericJourneyNodeSelectionBatch:
         return GenericJourneyNodeSelectionBatch(
             logger=self._logger,
+            meter=self._meter,
             guideline_store=self._guideline_store,
             optimization_policy=self._optimization_policy,
             schematic_generator=self._journey_step_selection_schematic_generator,
@@ -592,5 +616,12 @@ class GenericGuidelineMatchingStrategy(GuidelineMatchingStrategy):
             journey_path=context.journey_paths.get(examined_journey.id, []),
         )
 
-    def _get_optimal_batch_size(self, guidelines: dict[GuidelineId, Guideline]) -> int:
-        return self._optimization_policy.get_guideline_matching_batch_size(len(guidelines))
+    def _get_optimal_batch_size(
+        self,
+        guidelines: dict[GuidelineId, Guideline],
+        batch_type: type[GuidelineMatchingBatch],
+    ) -> int:
+        return self._optimization_policy.get_guideline_matching_batch_size(
+            len(guidelines),
+            hints={"type": batch_type},
+        )

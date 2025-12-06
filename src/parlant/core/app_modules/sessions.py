@@ -7,7 +7,9 @@ from parlant.core.agents import AgentId, AgentStore
 from parlant.core.async_utils import Timeout
 from parlant.core.background_tasks import BackgroundTaskService
 from parlant.core.common import JSONSerializable
-from parlant.core.contextual_correlator import ContextualCorrelator
+from parlant.core.meter import Meter
+from parlant.core.persistence.common import Cursor, SortDirection
+from parlant.core.tracer import Tracer
 from parlant.core.customers import CustomerId, CustomerStore
 from parlant.core.emissions import EventEmitterFactory
 from parlant.core.engines.types import Context, Engine, UtteranceRequest
@@ -15,19 +17,60 @@ from parlant.core.loggers import Logger
 from parlant.core.nlp.moderation import CustomerModerationContext, ModerationService
 from parlant.core.nlp.service import NLPService
 from parlant.core.sessions import (
+    AgentState,
+    ConsumerId,
     Event,
+    EventId,
     EventKind,
     EventSource,
+    EventUpdateParams,
     MessageEventData,
     Participant,
     Session,
     SessionId,
     SessionListener,
+    SessionMode,
     SessionStatus,
     SessionStore,
-    SessionUpdateParams,
     StatusEventData,
 )
+from dataclasses import dataclass
+from typing_extensions import TypedDict
+
+
+class SessionUpdateParamsModel(TypedDict, total=False):
+    """Parameters for updating a session."""
+
+    customer_id: CustomerId
+    agent_id: AgentId
+    mode: SessionMode
+    title: str | None
+    consumption_offsets: Mapping[ConsumerId, int]
+    agent_states: Sequence[AgentState]
+    metadata: Mapping[str, JSONSerializable]
+
+
+class EventMetadataUpdateParamsModel(TypedDict, total=False):
+    """Parameters for updating event metadata with granular control."""
+
+    set: Mapping[str, JSONSerializable]
+    unset: Sequence[str]
+
+
+class EventUpdateParamsModel(TypedDict, total=False):
+    """Parameters for updating an event."""
+
+    metadata: EventMetadataUpdateParamsModel
+
+
+@dataclass(frozen=True)
+class SessionListingModel:
+    """Paginated result model for sessions at the application layer"""
+
+    items: Sequence[Session]
+    total_count: int
+    has_more: bool
+    next_cursor: Cursor | None = None
 
 
 class Moderation(Enum):
@@ -38,18 +81,19 @@ class Moderation(Enum):
     NONE = "none"
 
 
-def _get_jailbreak_moderation_service(logger: Logger) -> ModerationService:
+def _get_jailbreak_moderation_service(logger: Logger, meter: Meter) -> ModerationService:
     from parlant.adapters.nlp.lakera import LakeraGuard
 
-    return LakeraGuard(logger)
+    return LakeraGuard(logger, meter)
 
 
 class SessionModule:
     def __init__(
         self,
         logger: Logger,
+        meter: Meter,
         agent_store: AgentStore,
-        correlator: ContextualCorrelator,
+        tracer: Tracer,
         session_store: SessionStore,
         customer_store: CustomerStore,
         session_listener: SessionListener,
@@ -59,8 +103,9 @@ class SessionModule:
         background_task_service: BackgroundTaskService,
     ):
         self._logger = logger
+        self._meter = meter
         self._agent_store = agent_store
-        self._correlator = correlator
+        self._tracer = tracer
 
         self._session_store = session_store
         self._customer_store = customer_store
@@ -79,7 +124,7 @@ class SessionModule:
         min_offset: int,
         kinds: Sequence[EventKind] = [],
         source: EventSource | None = None,
-        correlation_id: str | None = None,
+        trace_id: str | None = None,
         timeout: Timeout = Timeout.infinite(),
     ) -> bool:
         return await self._session_listener.wait_for_events(
@@ -87,7 +132,7 @@ class SessionModule:
             min_offset=min_offset,
             kinds=kinds,
             source=source,
-            correlation_id=correlation_id,
+            trace_id=trace_id,
             timeout=timeout,
         )
 
@@ -97,6 +142,7 @@ class SessionModule:
         agent_id: AgentId,
         title: str | None = None,
         allow_greeting: bool = False,
+        metadata: Mapping[str, JSONSerializable] | None = None,
     ) -> Session:
         _ = await self._agent_store.read_agent(agent_id=agent_id)
 
@@ -105,6 +151,7 @@ class SessionModule:
             customer_id=customer_id,
             agent_id=agent_id,
             title=title,
+            metadata=metadata or {},
         )
 
         if allow_greeting:
@@ -120,18 +167,29 @@ class SessionModule:
         self,
         agent_id: AgentId | None,
         customer_id: CustomerId | None,
-    ) -> Sequence[Session]:
-        sessions = await self._session_store.list_sessions(
+        limit: int | None = None,
+        cursor: Cursor | None = None,
+        sort_direction: SortDirection | None = None,
+    ) -> SessionListingModel:
+        result = await self._session_store.list_sessions(
             agent_id=agent_id,
             customer_id=customer_id,
+            limit=limit,
+            cursor=cursor,
+            sort_direction=sort_direction,
         )
 
-        return sessions
+        return SessionListingModel(
+            items=result.items,
+            total_count=result.total_count,
+            has_more=result.has_more,
+            next_cursor=result.next_cursor,
+        )
 
     async def update(
         self,
         session_id: SessionId,
-        params: SessionUpdateParams,
+        params: SessionUpdateParamsModel,
     ) -> Session:
         session = await self._session_store.update_session(
             session_id=session_id,
@@ -152,6 +210,7 @@ class SessionModule:
         session_id: SessionId,
         kind: EventKind,
         data: Mapping[str, Any],
+        metadata: Mapping[str, JSONSerializable] | None,
         source: EventSource = EventSource.CUSTOMER,
         trigger_processing: bool = True,
     ) -> Event:
@@ -159,8 +218,9 @@ class SessionModule:
             session_id=session_id,
             source=source,
             kind=kind,
-            correlation_id=self._correlator.correlation_id,
+            trace_id=self._tracer.trace_id,
             data=data,
+            metadata=metadata or {},
         )
 
         if trigger_processing:
@@ -175,6 +235,7 @@ class SessionModule:
         source: EventSource,
         status: SessionStatus,
         data: JSONSerializable,
+        metadata: Mapping[str, JSONSerializable] | None,
     ) -> Event:
         status_data: StatusEventData = {
             "status": status,
@@ -185,6 +246,7 @@ class SessionModule:
             session_id=session_id,
             kind=EventKind.STATUS,
             data=status_data,
+            metadata=metadata,
             source=source,
             trigger_processing=False,
         )
@@ -196,6 +258,7 @@ class SessionModule:
         message: str,
         source: EventSource,
         trigger_processing: bool,
+        metadata: Mapping[str, JSONSerializable] | None,
     ) -> Event:
         flagged = False
         tags: Set[str] = set()
@@ -210,7 +273,9 @@ class SessionModule:
             tags.update(check.tags)
 
         if moderation == Moderation.PARANOID:
-            check = await _get_jailbreak_moderation_service(self._logger).moderate_customer(context)
+            check = await _get_jailbreak_moderation_service(
+                self._logger, self._meter
+            ).moderate_customer(context)
             if "jailbreak" in check.tags:
                 flagged = True
                 tags.update({"jailbreak"})
@@ -237,6 +302,7 @@ class SessionModule:
             data=message_data,
             source=source,
             trigger_processing=trigger_processing,
+            metadata=metadata,
         )
 
     async def create_human_agent_message_event(
@@ -244,6 +310,7 @@ class SessionModule:
         session_id: SessionId,
         message: str,
         participant: Participant,
+        metadata: Mapping[str, JSONSerializable] | None,
     ) -> Event:
         message_data: MessageEventData = {
             "message": message,
@@ -261,6 +328,7 @@ class SessionModule:
             data=message_data,
             source=EventSource.HUMAN_AGENT,
             trigger_processing=False,
+            metadata=metadata,
         )
 
         return event
@@ -269,6 +337,7 @@ class SessionModule:
         self,
         session_id: SessionId,
         message: str,
+        metadata: Mapping[str, JSONSerializable] | None,
     ) -> Event:
         session = await self._session_store.read_session(session_id)
         agent = await self._agent_store.read_agent(session.agent_id)
@@ -287,18 +356,18 @@ class SessionModule:
             data=message_data,
             source=EventSource.HUMAN_AGENT_ON_BEHALF_OF_AI_AGENT,
             trigger_processing=False,
+            metadata=metadata,
         )
 
         return event
 
     async def dispatch_processing_task(self, session: Session) -> str:
-        with self._correlator.scope("process", {"session": session}):
-            await self._background_task_service.restart(
-                self._process_session(session),
-                tag=f"process-session({session.id})",
-            )
+        await self._background_task_service.restart(
+            self._process_session(session),
+            tag=f"process-session({session.id})",
+        )
 
-            return self._correlator.correlation_id
+        return self._tracer.trace_id
 
     async def _process_session(self, session: Session) -> None:
         event_emitter = await self._event_emitter_factory.create_event_emitter(
@@ -320,11 +389,11 @@ class SessionModule:
     ) -> Event:
         session = await self._session_store.read_session(session_id)
 
-        correlation_id = await self.dispatch_processing_task(session)
+        trace_id = await self.dispatch_processing_task(session)
 
         await self._session_listener.wait_for_events(
             session_id=session_id,
-            correlation_id=correlation_id,
+            trace_id=trace_id,
             timeout=Timeout(60),
         )
 
@@ -332,7 +401,7 @@ class SessionModule:
             iter(
                 await self._session_store.list_events(
                     session_id=session_id,
-                    correlation_id=correlation_id,
+                    trace_id=trace_id,
                     kinds=[EventKind.STATUS],
                 )
             )
@@ -347,7 +416,7 @@ class SessionModule:
     ) -> Event:
         session = await self._session_store.read_session(session_id)
 
-        with self._correlator.scope("utter", {"session": session}):
+        with self._tracer.span("utter", {"session_id": session_id}):
             event_emitter = await self._event_emitter_factory.create_event_emitter(
                 emitting_agent_id=session.agent_id,
                 session_id=session.id,
@@ -361,7 +430,7 @@ class SessionModule:
 
             event, *_ = await self._session_store.list_events(
                 session_id=session_id,
-                correlation_id=self._correlator.correlation_id,
+                trace_id=self._tracer.trace_id,
                 kinds=[EventKind.MESSAGE],
             )
 
@@ -373,14 +442,14 @@ class SessionModule:
         min_offset: int,
         source: EventSource | None,
         kinds: Sequence[EventKind],
-        correlation_id: str | None,
+        trace_id: str | None,
     ) -> Sequence[Event]:
         events = await self._session_store.list_events(
             session_id=session_id,
             min_offset=min_offset,
             source=source,
             kinds=kinds,
-            correlation_id=correlation_id,
+            trace_id=trace_id,
         )
 
         return events
@@ -405,13 +474,13 @@ class SessionModule:
 
         event_at_min_offset = events_starting_from_min_offset[0]
 
-        first_event_of_correlation_id = next(
-            e for e in events if e.correlation_id == event_at_min_offset.correlation_id
+        first_event_of_trace_id = next(
+            e for e in events if e.trace_id == event_at_min_offset.trace_id
         )
 
-        if event_at_min_offset.id != first_event_of_correlation_id.id:
+        if event_at_min_offset.id != first_event_of_trace_id.id:
             raise ValueError(
-                "Cannot delete events with offset < min_offset unless they are the first event of their correlation ID"
+                "Cannot delete events with offset < min_offset unless they are the first event of their trace ID"
             )
 
         for e in events_starting_from_min_offset:
@@ -423,7 +492,7 @@ class SessionModule:
         state_index_offset = next(
             i
             for i, s in enumerate(session.agent_states, start=0)
-            if s.correlation_id.startswith(event_at_min_offset.correlation_id)
+            if s.trace_id.startswith(event_at_min_offset.trace_id)
         )
 
         agent_states = session.agent_states[:state_index_offset]
@@ -431,4 +500,49 @@ class SessionModule:
         await self._session_store.update_session(
             session_id=session_id,
             params={"agent_states": agent_states},
+        )
+
+    async def read_event(
+        self,
+        session_id: SessionId,
+        event_id: EventId,
+    ) -> Event:
+        """Reads a single event by ID."""
+        return await self._session_store.read_event(
+            session_id=session_id,
+            event_id=event_id,
+        )
+
+    async def update_event(
+        self,
+        session_id: SessionId,
+        event_id: EventId,
+        params: EventUpdateParamsModel,
+    ) -> Event:
+        """Updates an event. Currently supports updating metadata, but extensible for future properties."""
+        # Convert from app_modules EventUpdateParamsModel to store EventUpdateParams
+        store_params: EventUpdateParams = {}
+
+        if "metadata" in params and params["metadata"]:
+            # For metadata updates, we need to get current event and apply set/unset operations
+            current_event = await self.read_event(session_id, event_id)
+            current_metadata = dict(current_event.metadata)
+
+            metadata_params = params["metadata"]
+
+            # Apply set operations
+            if "set" in metadata_params and metadata_params["set"]:
+                current_metadata.update(metadata_params["set"])
+
+            # Apply unset operations
+            if "unset" in metadata_params and metadata_params["unset"]:
+                for key in metadata_params["unset"]:
+                    current_metadata.pop(key, None)
+
+            store_params["metadata"] = current_metadata
+
+        return await self._session_store.update_event(
+            session_id=session_id,
+            event_id=event_id,
+            params=store_params,
         )

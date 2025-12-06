@@ -64,7 +64,6 @@ CapabilitySignalsField: TypeAlias = Annotated[
 CapabilityTagsField: TypeAlias = Annotated[
     list[TagId],
     Field(
-        default=None,
         description="List of tag IDs associated with the capability",
         examples=[["tag1", "tag2"]],
     ),
@@ -91,7 +90,7 @@ class CapabilityDTO(
     title: CapabilityTitleField
     description: CapabilityDescriptionField
     signals: CapabilitySignalsField
-    tags: CapabilityTagsField
+    tags: CapabilityTagsField = []
 
 
 class CapabilityCreationParamsDTO(
@@ -111,7 +110,6 @@ class CapabilityCreationParamsDTO(
 CapabilityTagUpdateAddField: TypeAlias = Annotated[
     list[TagId],
     Field(
-        default=None,
         description="List of tag IDs to add to the capability",
         examples=[["tag1", "tag2"]],
     ),
@@ -120,7 +118,6 @@ CapabilityTagUpdateAddField: TypeAlias = Annotated[
 CapabilityTagUpdateRemoveField: TypeAlias = Annotated[
     list[TagId],
     Field(
-        default=None,
         description="List of tag IDs to remove from the capability",
         examples=[["tag1", "tag2"]],
     ),
@@ -184,7 +181,7 @@ def create_router(
                 "description": "Capability successfully created. Returns the complete capability object including generated ID.",
                 "content": example_json_content(capability_example),
             },
-            status.HTTP_422_UNPROCESSABLE_ENTITY: {
+            status.HTTP_422_UNPROCESSABLE_CONTENT: {
                 "description": "Validation error in request parameters"
             },
         },
@@ -302,7 +299,7 @@ def create_router(
             status.HTTP_404_NOT_FOUND: {
                 "description": "Capability not found. The specified `capability_id` does not exist"
             },
-            status.HTTP_422_UNPROCESSABLE_ENTITY: {
+            status.HTTP_422_UNPROCESSABLE_CONTENT: {
                 "description": "Validation error in update parameters"
             },
         },

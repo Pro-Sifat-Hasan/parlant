@@ -3,8 +3,19 @@ from typing import Mapping, Sequence
 
 from parlant.core.agents import AgentId, AgentStore
 from parlant.core.loggers import Logger
-from parlant.core.customers import CustomerId, CustomerStore, Customer
+from parlant.core.customers import CustomerId, CustomerStore, Customer, CustomerListing
+from parlant.core.persistence.common import Cursor, SortDirection
 from parlant.core.tags import Tag, TagId, TagStore
+
+
+@dataclass(frozen=True)
+class CustomerListingModel:
+    """Paginated result model for customers at the application layer"""
+
+    items: Sequence[Customer]
+    total_count: int
+    has_more: bool
+    next_cursor: Cursor | None = None
 
 
 @dataclass(frozen=True)
@@ -43,6 +54,7 @@ class CustomerModule:
         name: str,
         extra: Mapping[str, str],
         tags: Sequence[TagId] | None,
+        id: CustomerId | None = None,
     ) -> Customer:
         if tags:
             for tag_id in tags:
@@ -54,6 +66,7 @@ class CustomerModule:
             name=name,
             extra=extra,
             tags=tags or [],
+            id=id,
         )
         return customer
 
@@ -61,9 +74,18 @@ class CustomerModule:
         customer = await self._customer_store.read_customer(customer_id=customer_id)
         return customer
 
-    async def find(self) -> Sequence[Customer]:
-        customers = await self._customer_store.list_customers()
-        return customers
+    async def find(
+        self,
+        limit: int | None = None,
+        cursor: Cursor | None = None,
+        sort_direction: SortDirection | None = None,
+    ) -> CustomerListing:
+        result = await self._customer_store.list_customers(
+            limit=limit,
+            cursor=cursor,
+            sort_direction=sort_direction,
+        )
+        return result
 
     async def update(
         self,

@@ -8,9 +8,12 @@ import traceback
 from typing import Any, Optional, cast
 from typing_extensions import override
 from parlant.core import async_utils
-from parlant.core.common import DefaultBaseModel, JSONSerializable
+from parlant.core.common import Criticality, DefaultBaseModel, JSONSerializable
 
-from parlant.core.engines.alpha.guideline_matching.generic.common import internal_representation
+from parlant.core.engines.alpha.guideline_matching.common import measure_guideline_matching_batch
+from parlant.core.engines.alpha.guideline_matching.generic.common import (
+    internal_representation,
+)
 from parlant.core.engines.alpha.guideline_matching.guideline_match import (
     GuidelineMatch,
 )
@@ -18,6 +21,8 @@ from parlant.core.engines.alpha.guideline_matching.guideline_matcher import (
     GuidelineMatchingBatch,
     GuidelineMatchingBatchError,
     GuidelineMatchingBatchResult,
+)
+from parlant.core.engines.alpha.guideline_matching.guideline_matching_context import (
     GuidelineMatchingContext,
 )
 from parlant.core.engines.alpha.optimization_policy import OptimizationPolicy
@@ -25,6 +30,7 @@ from parlant.core.engines.alpha.prompt_builder import PromptBuilder
 from parlant.core.guidelines import Guideline, GuidelineContent, GuidelineId, GuidelineStore
 from parlant.core.journeys import Journey
 from parlant.core.loggers import Logger
+from parlant.core.meter import Meter
 from parlant.core.nlp.generation import SchematicGenerator
 from parlant.core.nlp.generation_info import GenerationInfo, UsageInfo
 from parlant.core.sessions import Event, EventId, EventKind, EventSource
@@ -77,6 +83,7 @@ class _JourneyNode:  # Refactor after node type is implemented
     outgoing_edges: list[_JourneyEdge]
     kind: JourneyNodeKind
     customer_dependent_action: bool
+    description: Optional[str] = None
     customer_action_description: Optional[str] = None
     agent_dependent_action: Optional[bool] = None
     agent_action_description: Optional[str] = None
@@ -187,6 +194,7 @@ def build_node_wrappers(guidelines: Sequence[Guideline]) -> dict[str, _JourneyNo
                 outgoing_edges=[],
                 kind=kind,
                 customer_dependent_action=customer_dependent_action,
+                description=internal_representation(g).description,
                 customer_action_description=cast(
                     dict[str, str | None], g.metadata.get("customer_dependent_action_data", {})
                 ).get("customer_action", None),
@@ -378,8 +386,9 @@ def get_journey_transition_map_text(
         elif node.id != ROOT_INDEX:
             flags_str += "- NOT PREVIOUSLY EXECUTED: This step was not previously executed. You may not backtrack to this step.\n"
         if print_node:
+            description_str = f"\nDescription: {node.description}" if node.description else ""
             nodes_str += f"""
-STEP {node_index}: {displayed_node_action}
+STEP {node_index}: {displayed_node_action}{description_str}
 {flags_str}
 TRANSITIONS:
 {get_node_transition_text(node)}
@@ -397,6 +406,7 @@ class GenericJourneyNodeSelectionBatch(GuidelineMatchingBatch):
     def __init__(
         self,
         logger: Logger,
+        meter: Meter,
         guideline_store: GuidelineStore,
         optimization_policy: OptimizationPolicy,
         schematic_generator: SchematicGenerator[JourneyNodeSelectionSchema],
@@ -406,6 +416,7 @@ class GenericJourneyNodeSelectionBatch(GuidelineMatchingBatch):
         journey_path: Sequence[str | None] = [],
     ) -> None:
         self._logger = logger
+        self._meter = meter
 
         self._guideline_store = guideline_store
 
@@ -415,6 +426,11 @@ class GenericJourneyNodeSelectionBatch(GuidelineMatchingBatch):
         self._context = context
         self._examined_journey = examined_journey
         self._previous_path: Sequence[str | None] = journey_path
+
+    @property
+    @override
+    def size(self) -> int:
+        return 1
 
     def auto_return_match(self) -> GuidelineMatchingBatchResult | None:
         if self._previous_path and self._previous_path[-1] in self._node_wrappers:
@@ -470,7 +486,7 @@ class GenericJourneyNodeSelectionBatch(GuidelineMatchingBatch):
             )
         )
 
-        with self._logger.operation(self._examined_journey.title):
+        async with measure_guideline_matching_batch(self._meter, self):
             prompt = self._build_prompt(journey_conditions, shots=await self.shots())
 
             generation_attempt_temperatures = (
@@ -587,6 +603,7 @@ class GenericJourneyNodeSelectionBatch(GuidelineMatchingBatch):
                             condition=c,
                             action=None,
                         ),
+                        criticality=Criticality.MEDIUM,
                         enabled=False,
                         tags=[],
                     )
@@ -808,6 +825,7 @@ Example section is over. The following is the real data you need to use for your
         builder.add_context_variables(self._context.context_variables)
         builder.add_glossary(self._context.terms)
         builder.add_capabilities_for_guideline_matching(self._context.capabilities)
+        builder.add_customer_identity(self._context.customer, self._context.session)
         builder.add_interaction_history(self._context.interaction_history)
         builder.add_staged_tool_events(self._context.staged_events)
 
@@ -875,8 +893,9 @@ def _make_event(e_id: str, source: EventSource, message: str) -> Event:
         kind=EventKind.MESSAGE,
         creation_utc=datetime.now(timezone.utc),
         offset=0,
-        correlation_id="",
+        trace_id="",
         data={"message": message},
+        metadata={},
         deleted=False,
     )
 

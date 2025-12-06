@@ -12,6 +12,8 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import asyncio
+import time
 from typing import Any
 from parlant.core.capabilities import CapabilityStore
 from parlant.core.guideline_tool_associations import GuidelineToolAssociationStore
@@ -197,7 +199,7 @@ class Test_that_an_agent_can_be_found_using_tool_context(SDKTest):
         await self.agent.attach_tool(check_what_is_spatio, condition="the user asks about spatio")
 
     async def run(self, ctx: Context) -> None:
-        answer = await ctx.send_and_receive(
+        answer = await ctx.send_and_receive_message(
             customer_message="What is spatio?",
             recipient=self.agent,
         )
@@ -211,12 +213,12 @@ class Test_that_the_output_of_an_agent_can_be_intercepted(SDKTest):
 
     async def configure_hooks(self, hooks: p.EngineHooks) -> p.EngineHooks:
         async def intercept_message(
-            ctx: p.LoadedContext, payload: Any, exc: Exception | None
+            ctx: p.EngineContext, payload: Any, exc: Exception | None
         ) -> p.EngineHookResult:
             _ = payload  # Here is where validations would run (payload is the generated message)
 
             await ctx.session_event_emitter.emit_message_event(
-                correlation_id=ctx.correlator.correlation_id,
+                trace_id=ctx.tracer.trace_id,
                 data="Bananas! More bananas!",
             )
 
@@ -230,5 +232,126 @@ class Test_that_the_output_of_an_agent_can_be_intercepted(SDKTest):
         self.agent = await server.create_agent(name="Dummy Agent", description="")
 
     async def run(self, ctx: Context) -> None:
-        answer = await ctx.send_and_receive(customer_message="Hello", recipient=self.agent)
+        answer = await ctx.send_and_receive_message(customer_message="Hello", recipient=self.agent)
         assert answer == "Bananas! More bananas!"
+
+
+class Test_that_an_agent_can_be_created_with_custom_id(SDKTest):
+    async def setup(self, server: p.Server) -> None:
+        self.agent = await server.create_agent(
+            id="my-custom-agent-id",
+            name="Custom ID Agent",
+            description="This agent has a custom ID",
+        )
+
+    async def run(self, ctx: Context) -> None:
+        assert self.agent.id == "my-custom-agent-id"
+
+        # Verify the agent can be retrieved with the custom ID
+        retrieved_agent = await ctx.server.find_agent(id="my-custom-agent-id")
+        assert retrieved_agent is not None
+        assert retrieved_agent.id == "my-custom-agent-id"
+        assert retrieved_agent.name == "Custom ID Agent"
+
+
+class Test_that_an_agent_with_basic_policy_sends_preamble_and_message(SDKTest):
+    async def setup(self, server: p.Server) -> None:
+        from parlant.core.engines.alpha.perceived_performance_policy import (
+            BasicPerceivedPerformancePolicy,
+        )
+
+        self.agent = await server.create_agent(
+            name="Basic Policy Agent",
+            description="Agent with basic perceived performance policy",
+            perceived_performance_policy=BasicPerceivedPerformancePolicy(),
+        )
+
+    async def run(self, ctx: Context) -> None:
+        session = await ctx.client.sessions.create(
+            agent_id=self.agent.id,
+            allow_greeting=False,
+        )
+
+        customer_event = await ctx.client.sessions.create_event(
+            session_id=session.id,
+            kind="message",
+            source="customer",
+            message="Hello",
+        )
+
+        # Poll for messages until we get 2 messages (or timeout after 30 seconds)
+        start_time = time.time()
+        agent_messages: list[Any] = []
+        while len(agent_messages) < 2:
+            if time.time() - start_time > 30:
+                raise TimeoutError(
+                    f"Timeout waiting for 2 messages. Got {len(agent_messages)} messages."
+                )
+
+            agent_messages = await ctx.client.sessions.list_events(
+                session_id=session.id,
+                min_offset=customer_event.offset,
+                source="ai_agent",
+                kinds="message",
+                wait_for_data=5,
+            )
+
+            if len(agent_messages) < 2:
+                await asyncio.sleep(0.5)
+
+        # With BasicPerceivedPerformancePolicy, we expect 2 messages:
+        # 1. A preamble message (tagged with preamble tag)
+        # 2. The actual response message
+        assert len(agent_messages) == 2
+
+        # Check that the first message is a preamble
+        first_message_data = agent_messages[0].model_dump().get("data", {})
+        first_message_tags = first_message_data.get("tags", [])
+        assert any("preamble" in str(tag) for tag in first_message_tags)
+
+        # Check that the second message is the actual response
+        second_message_data = agent_messages[1].model_dump().get("data", {})
+        assert second_message_data.get("message") is not None
+
+
+class Test_that_an_agent_with_null_policy_sends_only_message(SDKTest):
+    async def setup(self, server: p.Server) -> None:
+        from parlant.core.engines.alpha.perceived_performance_policy import (
+            NullPerceivedPerformancePolicy,
+        )
+
+        self.agent = await server.create_agent(
+            name="Null Policy Agent",
+            description="Agent with null perceived performance policy",
+            perceived_performance_policy=NullPerceivedPerformancePolicy(),
+        )
+
+    async def run(self, ctx: Context) -> None:
+        session = await ctx.client.sessions.create(
+            agent_id=self.agent.id,
+            allow_greeting=False,
+        )
+
+        customer_event = await ctx.client.sessions.create_event(
+            session_id=session.id,
+            kind="message",
+            source="customer",
+            message="Hello",
+        )
+
+        agent_messages = await ctx.client.sessions.list_events(
+            session_id=session.id,
+            min_offset=customer_event.offset,
+            source="ai_agent",
+            kinds="message",
+            wait_for_data=30,
+        )
+
+        # With NullPerceivedPerformancePolicy, we expect only 1 message:
+        # The actual response (no preamble)
+        assert len(agent_messages) == 1
+
+        # Check that the message is the actual response (not a preamble)
+        message_data = agent_messages[0].model_dump().get("data", {})
+        message_tags = message_data.get("tags", [])
+        assert not any("preamble" in str(tag) for tag in message_tags)

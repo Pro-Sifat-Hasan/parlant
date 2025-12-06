@@ -12,11 +12,15 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+from collections import defaultdict
 from dataclasses import dataclass, field
 from enum import Enum, auto
-from typing import Any, Awaitable, Callable, Optional, Sequence, TypeAlias
+from typing import Any, Awaitable, Callable, Optional, Sequence, TypeAlias, Union
 
-from parlant.core.engines.alpha.loaded_context import LoadedContext
+from parlant.core.engines.alpha.engine_context import EngineContext
+from parlant.core.engines.alpha.engine_context import LoadedContext  # type: ignore
+from parlant.core.guidelines import GuidelineId
+from parlant.core.engines.alpha.guideline_matching.guideline_match import GuidelineMatch
 
 
 class EngineHookResult(Enum):
@@ -37,10 +41,12 @@ class EngineHookResult(Enum):
     """
 
 
-EngineHook: TypeAlias = Callable[
-    [LoadedContext, Any, Optional[Exception]], Awaitable[EngineHookResult]
+EngineHook: TypeAlias = Union[
+    Callable[[EngineContext, Any, Optional[Exception]], Awaitable[EngineHookResult]],
+    # TODO: Remove this once LoadedContext is removed
+    Callable[[LoadedContext, Any, Optional[Exception]], Awaitable[EngineHookResult]],  # type: ignore
 ]
-"""A callable that takes a LoadedContext and an optional Exception, and returns an EngineHookResult."""
+"""A callable that takes a EngineContext and an optional Exception, and returns an EngineHookResult."""
 
 
 @dataclass(frozen=False)
@@ -87,54 +93,60 @@ class EngineHooks:
     on_messages_emitted: list[EngineHook] = field(default_factory=list)
     """Called right after all messages were emitted into the session"""
 
-    async def call_on_error(self, context: LoadedContext, exception: Exception) -> bool:
+    guideline_match_handlers: dict[
+        GuidelineId, list[Callable[[EngineContext, GuidelineMatch], Awaitable[None]]]
+    ] = field(default_factory=lambda: defaultdict(list))
+    """Map from GuidelineId to list of handlers called when that guideline is resolved"""
+
+    async def call_on_error(self, context: EngineContext, exception: Exception) -> bool:
         return await self.call_hooks(self.on_error, context, None, exception)
 
-    async def call_on_acknowledging(self, context: LoadedContext) -> bool:
+    async def call_on_acknowledging(self, context: EngineContext) -> bool:
         return await self.call_hooks(self.on_acknowledging, context, None)
 
-    async def call_on_acknowledged(self, context: LoadedContext) -> bool:
+    async def call_on_acknowledged(self, context: EngineContext) -> bool:
         return await self.call_hooks(self.on_acknowledged, context, None)
 
-    async def call_on_preparing(self, context: LoadedContext) -> bool:
+    async def call_on_preparing(self, context: EngineContext) -> bool:
         return await self.call_hooks(self.on_preparing, context, None)
 
-    async def call_on_preparation_iteration_start(self, context: LoadedContext) -> bool:
+    async def call_on_preparation_iteration_start(self, context: EngineContext) -> bool:
         return await self.call_hooks(self.on_preparation_iteration_start, context, None)
 
-    async def call_on_preparation_iteration_end(self, context: LoadedContext) -> bool:
+    async def call_on_preparation_iteration_end(self, context: EngineContext) -> bool:
         return await self.call_hooks(self.on_preparation_iteration_end, context, None)
 
-    async def call_on_generating_preamble(self, context: LoadedContext) -> bool:
+    async def call_on_generating_preamble(self, context: EngineContext) -> bool:
         return await self.call_hooks(self.on_generating_preamble, context, None)
 
-    async def call_on_preamble_generated(self, context: LoadedContext, payload: str) -> bool:
+    async def call_on_preamble_generated(self, context: EngineContext, payload: str) -> bool:
         return await self.call_hooks(self.on_preamble_generated, context, payload)
 
-    async def call_on_preamble_emitted(self, context: LoadedContext) -> bool:
+    async def call_on_preamble_emitted(self, context: EngineContext) -> bool:
         return await self.call_hooks(self.on_preamble_emitted, context, None)
 
-    async def call_on_generating_messages(self, context: LoadedContext) -> bool:
+    async def call_on_generating_messages(self, context: EngineContext) -> bool:
         return await self.call_hooks(self.on_generating_messages, context, None)
 
-    async def call_on_draft_generated(self, context: LoadedContext, payload: str) -> bool:
+    async def call_on_draft_generated(self, context: EngineContext, payload: str) -> bool:
         return await self.call_hooks(self.on_draft_generated, context, payload)
 
-    async def call_on_message_generated(self, context: LoadedContext, payload: str) -> bool:
+    async def call_on_message_generated(self, context: EngineContext, payload: str) -> bool:
         return await self.call_hooks(self.on_message_generated, context, payload)
 
-    async def call_on_messages_emitted(self, context: LoadedContext) -> bool:
+    async def call_on_messages_emitted(self, context: EngineContext) -> bool:
         return await self.call_hooks(self.on_messages_emitted, context, None)
 
     async def call_hooks(
         self,
         hooks: Sequence[EngineHook],
-        context: LoadedContext,
+        context: EngineContext,
         payload: Any,
         exc: Optional[Exception] = None,
     ) -> bool:
         for callable in hooks:
-            match await callable(context, payload, exc):
+            # TODO: Remove type: ignore once LoadedContext is removed
+            match await callable(context, payload, exc):  # type: ignore
                 case EngineHookResult.CALL_NEXT:
                     continue
                 case EngineHookResult.RESOLVE:

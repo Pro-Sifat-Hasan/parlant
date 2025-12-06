@@ -22,14 +22,15 @@ from pytest import fixture
 
 from parlant.core.agents import Agent
 from parlant.core.capabilities import Capability
-from parlant.core.common import generate_id, JSONSerializable
+from parlant.core.common import Criticality, generate_id, JSONSerializable
 from parlant.core.context_variables import (
     ContextVariable,
     ContextVariableId,
     ContextVariableValue,
     ContextVariableValueId,
 )
-from parlant.core.contextual_correlator import ContextualCorrelator
+from parlant.core.meter import Meter
+from parlant.core.tracer import Tracer
 from parlant.core.customers import Customer
 from parlant.core.emission.event_buffer import EventBuffer
 from parlant.core.emissions import EmittedEvent
@@ -41,7 +42,7 @@ from parlant.core.engines.alpha.guideline_matching.guideline_matcher import (
     GuidelineMatcher,
     ResponseAnalysisContext,
 )
-from parlant.core.engines.alpha.loaded_context import Interaction, LoadedContext, ResponseState
+from parlant.core.engines.alpha.engine_context import Interaction, EngineContext, ResponseState
 from parlant.core.engines.alpha.optimization_policy import OptimizationPolicy
 from parlant.core.engines.alpha.tool_calling.tool_caller import ToolInsights
 from parlant.core.engines.types import Context
@@ -291,13 +292,13 @@ async def match_guidelines(
 ) -> Sequence[GuidelineMatch]:
     session = await context.container[SessionStore].read_session(session_id)
 
-    loaded_context = LoadedContext(
+    loaded_context = EngineContext(
         info=Context(
             session_id=session.id,
             agent_id=agent.id,
         ),
         logger=context.logger,
-        correlator=context.container[ContextualCorrelator],
+        tracer=context.container[Tracer],
         agent=agent,
         customer=customer,
         session=session,
@@ -365,6 +366,7 @@ async def create_guideline(
             condition=condition,
             action=action,
         ),
+        criticality=Criticality.MEDIUM,
         enabled=True,
         tags=tags,
         metadata=metadata,
@@ -395,13 +397,16 @@ def create_context_variable(
 ) -> tuple[ContextVariable, ContextVariableValue]:
     return ContextVariable(
         id=ContextVariableId("-"),
+        creation_utc=datetime.now(timezone.utc),
         name=name,
         description="",
         tool_id=None,
         freshness_rules=None,
         tags=tags,
     ), ContextVariableValue(
-        ContextVariableValueId("-"), last_modified=datetime.now(timezone.utc), data=data
+        ContextVariableValueId("-"),
+        last_modified=datetime.now(timezone.utc),
+        data=data,
     )
 
 
@@ -441,7 +446,7 @@ async def update_previously_applied_guidelines(
             agent_states=list(session.agent_states)
             + [
                 AgentState(
-                    correlation_id="<main>",
+                    trace_id="<main>",
                     applied_guideline_ids=applied_guideline_ids,
                     journey_paths={},
                 )
@@ -481,6 +486,7 @@ async def analyze_response_and_update_session(
 
     generic_response_analysis_batch = GenericResponseAnalysisBatch(
         logger=context.container[Logger],
+        meter=context.container[Meter],
         optimization_policy=context.container[OptimizationPolicy],
         schematic_generator=context.container[SchematicGenerator[GenericResponseAnalysisSchema]],
         context=ResponseAnalysisContext(
@@ -906,7 +912,11 @@ async def test_that_observational_guidelines_arent_wrongly_implied(
     )
     staged_events = [
         EmittedEvent(
-            source=EventSource.AI_AGENT, kind=EventKind.TOOL, correlation_id="", data=tool_result
+            source=EventSource.AI_AGENT,
+            kind=EventKind.TOOL,
+            trace_id="",
+            data=tool_result,
+            metadata=None,
         ),
     ]
 
@@ -964,7 +974,11 @@ async def test_that_observational_guidelines_are_detected_correctly_when_lots_of
     )
     staged_events = [
         EmittedEvent(
-            source=EventSource.AI_AGENT, kind=EventKind.TOOL, correlation_id="", data=tool_result
+            source=EventSource.AI_AGENT,
+            kind=EventKind.TOOL,
+            trace_id="",
+            data=tool_result,
+            metadata=None,
         ),
     ]
     conversation_context: list[tuple[EventSource, str]] = [

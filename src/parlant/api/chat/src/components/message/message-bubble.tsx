@@ -27,10 +27,10 @@ interface Props {
 	resendMessageFn?: (sessionId: string, text?: string) => void;
 	showLogs: (event: EventInterface) => void;
 	setIsEditing?: React.Dispatch<React.SetStateAction<boolean>>;
-	sameCorrelationMessages?: EventInterface[];
+	sameTraceMessages?: EventInterface[];
 }
 
-const MessageBubble = ({event, isFirstMessageInDate, showLogs, isContinual, showLogsForMessage, setIsEditing, flagged, flaggedChanged, sameCorrelationMessages}: Props) => {
+const MessageBubble = ({event, isFirstMessageInDate, showLogs, isContinual, showLogsForMessage, setIsEditing, flagged, flaggedChanged, sameTraceMessages: sameTraceMessages}: Props) => {
 	const ref = useRef<HTMLDivElement>(null);
 	const [agent] = useAtom(agentAtom);
 	const [customer] = useAtom(customerAtom);
@@ -66,6 +66,7 @@ const MessageBubble = ({event, isFirstMessageInDate, showLogs, isContinual, show
 	const colorPallete = getAvatarColor((isCustomer ? customer?.id : agent?.id) || '', isCustomer ? 'customer' : 'agent');
 	const name = isCustomer ? customer?.name : agent?.name;
 	const formattedName = isCustomer && isGuest ? 'Guest' : name;
+	const isEditDisabled = sameTraceMessages?.some((msg) => msg.serverStatus && msg.serverStatus !== 'ready' && msg.serverStatus !== 'error');
 
 	return (
 		<>
@@ -82,7 +83,7 @@ const MessageBubble = ({event, isFirstMessageInDate, showLogs, isContinual, show
 								<div className='font-medium text-[14px] text-[#282828] truncate'>{formattedName}</div>
 							</div>
 							<div className='flex items-center flex-1 justify-end'>
-								{!isCustomer && sameCorrelationMessages?.some((e: EventInterface) => e.data?.draft) && (
+								{!isCustomer && sameTraceMessages?.some((e: EventInterface) => e.data?.draft) && (
 									<div className='flex items-center me-[6px] pe-[6px] border-e border-[#EBECF0]'>
 										<Tooltip value={showDraft ? 'Hide Draft' : 'Show Draft'} side='top'>
 											<Button data-selected={showDraft} variant='ghost' className='flex p-1 h-fit items-center gap-1' onClick={() => setShowDraft(!showDraft)}>
@@ -101,7 +102,7 @@ const MessageBubble = ({event, isFirstMessageInDate, showLogs, isContinual, show
 												variant='ghost'
 												className='flex p-1 h-fit items-center gap-1'
 												onClick={() =>
-													dialog.openDialog('Flag Response', <FlagMessage existingFlagValue={flagged || ''} events={sameCorrelationMessages || [event]} sessionId={session?.id as string} onFlag={flaggedChanged} />, {width: '600px', height: '636px'})
+													dialog.openDialog('Flag Response', <FlagMessage existingFlagValue={flagged || ''} events={sameTraceMessages || [event]} sessionId={session?.id as string} onFlag={flaggedChanged} />, {width: '600px', height: '636px'})
 												}>
 												<Flag size={16} color='#777' />
 												<div className='text-[14px] text-[#777] font-normal px-[.25em]'>{'Flagged'}</div>
@@ -121,7 +122,7 @@ const MessageBubble = ({event, isFirstMessageInDate, showLogs, isContinual, show
 							</div>
 						</div>
 					)}
-					<DraftBubble open={showDraft} draft={sameCorrelationMessages?.find((e) => e.data?.draft)?.data?.draft || ''} />
+					<DraftBubble open={showDraft} draft={sameTraceMessages?.find((e) => e.data?.draft)?.data?.draft || ''} />
 					<div className='group/main relative'>
 						<div className={twMerge('flex items-center max-w-full', isCustomer && 'flex-row-reverse')}>
 							<div className='max-w-full'>
@@ -151,7 +152,7 @@ const MessageBubble = ({event, isFirstMessageInDate, showLogs, isContinual, show
 										<img src='icons/copy.svg' alt='edit' className='block opacity-50 rounded-[10px] group-hover:bg-[#EBECF0] size-[30px] p-[5px]' />
 									</div>
 								</Tooltip>
-								{isCustomer && (
+								{isCustomer && !isEditDisabled && (
 									<Tooltip value='Edit' side='top'>
 										<div data-testid='edit-button' role='button' onClick={() => setIsEditing?.(true)} className='group cursor-pointer'>
 											<img src='icons/edit-message.svg' alt='edit' className='block opacity-50 rounded-[10px] group-hover:bg-[#EBECF0] size-[30px] p-[5px]' />

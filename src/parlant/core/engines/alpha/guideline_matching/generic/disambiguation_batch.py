@@ -19,22 +19,29 @@ from datetime import datetime, timezone
 import traceback
 import json
 from typing import Optional
+from typing_extensions import override
 from parlant.core.common import DefaultBaseModel, JSONSerializable
-from parlant.core.engines.alpha.guideline_matching.generic.common import internal_representation
+from parlant.core.engines.alpha.guideline_matching.common import measure_guideline_matching_batch
+from parlant.core.engines.alpha.guideline_matching.generic.common import (
+    internal_representation,
+)
 from parlant.core.engines.alpha.guideline_matching.guideline_match import (
     GuidelineMatch,
 )
 from parlant.core.engines.alpha.guideline_matching.guideline_matcher import (
     GuidelineMatchingBatch,
     GuidelineMatchingBatchResult,
-    GuidelineMatchingContext,
     GuidelineMatchingBatchError,
+)
+from parlant.core.engines.alpha.guideline_matching.guideline_matching_context import (
+    GuidelineMatchingContext,
 )
 from parlant.core.engines.alpha.optimization_policy import OptimizationPolicy
 from parlant.core.engines.alpha.prompt_builder import BuiltInSection, PromptBuilder, SectionStatus
 from parlant.core.guidelines import Guideline, GuidelineContent, GuidelineId
 from parlant.core.journeys import JourneyId, JourneyStore
 from parlant.core.loggers import Logger
+from parlant.core.meter import Meter
 from parlant.core.nlp.generation import SchematicGenerator
 from parlant.core.sessions import Event, EventId, EventKind, EventSource
 from parlant.core.shots import Shot, ShotCollection
@@ -75,6 +82,7 @@ class GenericDisambiguationGuidelineMatchingBatch(GuidelineMatchingBatch):
     def __init__(
         self,
         logger: Logger,
+        meter: Meter,
         journey_store: JourneyStore,
         optimization_policy: OptimizationPolicy,
         schematic_generator: SchematicGenerator[DisambiguationGuidelineMatchesSchema],
@@ -83,12 +91,19 @@ class GenericDisambiguationGuidelineMatchingBatch(GuidelineMatchingBatch):
         context: GuidelineMatchingContext,
     ) -> None:
         self._logger = logger
+        self._meter = meter
+
         self._journey_store = journey_store
         self._optimization_policy = optimization_policy
         self._schematic_generator = schematic_generator
         self._disambiguation_guideline = disambiguation_guideline
         self._disambiguation_targets = disambiguation_targets
         self._context = context
+
+    @property
+    @override
+    def size(self) -> int:
+        return 1
 
     async def _get_disambiguation_targets(
         self,
@@ -125,12 +140,13 @@ class GenericDisambiguationGuidelineMatchingBatch(GuidelineMatchingBatch):
             i += 1
         return guidelines
 
+    @override
     async def process(self) -> GuidelineMatchingBatchResult:
         disambiguation_targets_guidelines = await self._get_disambiguation_targets(
             self._disambiguation_targets
         )
 
-        with self._logger.operation(str(self._disambiguation_guideline)):
+        async with measure_guideline_matching_batch(self._meter, self):
             prompt = self._build_prompt(
                 shots=await self.shots(),
                 disambiguation_targets_guidelines=disambiguation_targets_guidelines,
@@ -150,6 +166,7 @@ class GenericDisambiguationGuidelineMatchingBatch(GuidelineMatchingBatch):
                         prompt=prompt,
                         hints={"temperature": generation_attempt_temperatures[generation_attempt]},
                     )
+
                     self._logger.trace(
                         f"Completion:\n{inference.content.model_dump_json(indent=2)}"
                     )
@@ -296,34 +313,36 @@ Each guideline is composed of two parts:
 
 Task Description
 ----------------
-Sometimes a customer expresses that they’ve experienced something or want to proceed with something, but there are multiple possible ways to go, and it’s as-yet unclear what exactly they intend.
-In such cases, we need to identify the potential options and ask the customer which one they mean.
+During your interaction with the customer, they may express a need or problem that could potentially be handled by multiple guidelines, creating ambiguity.
+This occurs when multiple guideline conditions might apply, but insufficient information is available to determine which one should apply.
+In such cases, we need to identify the potentially relevant guidelines, and to ask the customer which one they intended to apply.
 
-Your task is to determine whether the customer’s intention is currently ambiguous and, if so, what the possible interpretations or directions are.
-You’ll be given a disambiguation condition — one that, if true, signals a potential ambiguity — and a list of related guidelines, each representing a possible path the customer might want to follow.
+Your task is to determine whether the customer’s intention is currently ambiguous in regards to the provided guidelines, and, if so, what the possible interpretations or directions are.
+You'll be given:
+1. A disambiguation condition that signals potential ambiguity when true
+2. A list of related guidelines, each representing a possible path the customer might follow
 
-If you identify an ambiguity, return the relevant guidelines that represent the available options.
+If you identify an ambiguity between these guidelines, return the relevant guidelines that represent the available options.
 Then, formulate a response in the format:
 "Ask the customer whether they want to do X, Y, or Z..."
-This response should clearly present the options to help resolve the ambiguity in the customer's request.
+This response should clearly present the options to help resolve the ambiguity.
 
 Notes:
 - Base your evaluation on the customer's most recent message.
-- If you determine that there is indeed an ambiguity - then, when one of the guidelines might be relevant - include it. We prefer to let the customer choose of all plausible options.
+- When ambiguity exists, include all plausible guidelines—let the customer choose among all viable options.
 - Some guidelines may turn out to be irrelevant based on the interaction. For example, due to earlier parts of the conversation or because the user's status (provided in the interaction history or
-as a context variable) rules them out. In such cases, the ambiguity may already be resolved (only one or none option is relevant) and note that no clarification is needed in such cases.
-
-- Notice that if you've already asked for disambiguation from the customer you need to **pay extra attention** to if we need to re-ask for clarification or the user responded and it was resolved.
+as a context variable) rules them out. If only one or no guidelines remain relevant, no ambiguity exists.
+- If you've already asked for disambiguation from the customer, **pay extra attention** to  whether you need to re-ask for clarification or whether the user responded and the ambiguity was already resolved.
 - **Accept brief customer responses as valid clarifications**: Customers often communicate with very short responses (single words or phrases like "return", "replace", "yes", "no"). If the customer's brief
  response clearly indicates their choice among the previously presented options, consider the ambiguity resolved even if their answer is not in complete sentences.
-
-distinction is between:
-- Pending clarification (customer hasn't answered yet) - re-disambiguate (disambiguation_requested = true, customer_resolved=false, is_ambiguous = true)
-- Clarification provided (customer has answered) - don't re-disambiguate the same issue (disambiguation_requested = true, customer_resolved=true, is_ambiguous = false)
-- New ambiguity (different unclear intent emerges) - do disambiguate (is_ambiguous = true)
-
-- Focus on current context: If the customer has changed the subject or moved on to a different topic in their most recent message, do not disambiguate previous unresolved issues.
+- If the customer was previously asked for disambiguation, carefully distinguish between the following cases:
+  1. Disambiguation requested and is Pending clarification (Disambiguation was already asked by the agent, but the customer hasn't answered yet) - In this case,  re-disambiguate (set disambiguation_requested = true, customer_resolved=false, is_ambiguous = true)
+  2. Disambiguation requested, clarification provided (customer has answered) - don't re-disambiguate the same issue (disambiguation_requested = true, customer_resolved=true, is_ambiguous = false)
+  3. New ambiguity (different unclear intent emerges) - do disambiguate (is_ambiguous = true)
+- **Focus on current context**: If the customer has changed the subject or moved on to a different topic in their most recent message, do not disambiguate previous unresolved issues.
 Always prioritize the customer's current request and intent over past ambiguities.
+
+
 """,
             props={},
         )
@@ -343,6 +362,7 @@ Examples of Guidelines Ambiguity Evaluation:
         builder.add_context_variables(self._context.context_variables)
         builder.add_glossary(self._context.terms)
         builder.add_capabilities_for_guideline_matching(self._context.capabilities)
+        builder.add_customer_identity(self._context.customer, self._context.session)
         builder.add_interaction_history(self._context.interaction_history)
         builder.add_staged_tool_events(self._context.staged_events)
         builder.add_section(
@@ -411,8 +431,9 @@ def _make_event(e_id: str, source: EventSource, message: str) -> Event:
         kind=EventKind.MESSAGE,
         creation_utc=datetime.now(timezone.utc),
         offset=0,
-        correlation_id="",
+        trace_id="",
         data={"message": message},
+        metadata={},
         deleted=False,
     )
 

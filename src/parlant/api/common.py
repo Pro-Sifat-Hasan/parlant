@@ -19,6 +19,7 @@ from typing import Annotated, Any, Mapping, Sequence, TypeAlias
 
 from parlant.core.common import DefaultBaseModel
 from parlant.core.evaluations import PayloadOperation
+from parlant.core.persistence.common import SortDirection
 from parlant.core.relationships import RelationshipId
 from parlant.core.guidelines import GuidelineId
 from parlant.core.tags import TagId
@@ -79,6 +80,33 @@ GuidelineActionField: TypeAlias = Annotated[
     Field(
         description="This action will be performed if the condition is satisfied",
         examples=["Sing the user a lullaby."],
+    ),
+]
+
+GuidelineDescriptionField: TypeAlias = Annotated[
+    str,
+    Field(
+        description="Optional description providing additional context for the guideline",
+        examples=["This applies only to premium customers with active subscriptions."],
+    ),
+]
+
+
+class CriticalityDTO(Enum):
+    """
+    The criticality level of a guideline.
+    """
+
+    LOW = "low"
+    MEDIUM = "medium"
+    HIGH = "high"
+
+
+GuidelineCriticalityField: TypeAlias = Annotated[
+    CriticalityDTO,
+    Field(
+        description="The criticality level of the guideline",
+        examples=["high"],
     ),
 ]
 
@@ -183,7 +211,6 @@ GuidelineMetadataField: TypeAlias = Annotated[
 GuidelineEnabledField: TypeAlias = Annotated[
     bool,
     Field(
-        default=True,
         description="Whether the guideline is enabled",
         examples=[True, False],
     ),
@@ -217,7 +244,9 @@ class GuidelineDTO(
     id: GuidelineIdField
     condition: GuidelineConditionField
     action: GuidelineActionField | None = None
-    enabled: GuidelineEnabledField
+    description: GuidelineDescriptionField | None = None
+    criticality: GuidelineCriticalityField = CriticalityDTO.MEDIUM
+    enabled: GuidelineEnabledField = True
     tags: GuidelineTagsField
     metadata: GuidelineMetadataField
 
@@ -459,6 +488,25 @@ class RelationshipKindDTO(Enum):
     DISAMBIGUATION = "disambiguation"
     OVERLAP = "overlap"
     REEVALUATION = "reevaluation"
+
+
+class SortDirectionDTO(Enum):
+    """The direction to sort results."""
+
+    ASC = "asc"
+    DESC = "desc"
+
+
+def sort_direction_dto_to_sort_direction(
+    dto: SortDirectionDTO,
+) -> SortDirection:
+    match dto:
+        case SortDirectionDTO.ASC:
+            return SortDirection.ASC
+        case SortDirectionDTO.DESC:
+            return SortDirection.DESC
+        case _:
+            raise ValueError(f"Unsupported sort direction: {dto}")
 
 
 class RelationshipDTO(

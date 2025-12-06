@@ -18,8 +18,10 @@ import json
 import traceback
 from typing import Any, Mapping, Optional, Sequence, cast
 from typing_extensions import override
+from parlant.core.async_utils import CancellationSuppressionLatch
 from parlant.core.capabilities import Capability
-from parlant.core.contextual_correlator import ContextualCorrelator
+from parlant.core.meter import Meter
+from parlant.core.tracer import Tracer
 from parlant.core.agents import Agent
 from parlant.core.context_variables import ContextVariable, ContextVariableValue
 from parlant.core.customers import Customer
@@ -27,7 +29,7 @@ from parlant.core.engines.alpha.guideline_matching.generic.common import (
     GuidelineInternalRepresentation,
     internal_representation,
 )
-from parlant.core.engines.alpha.loaded_context import LoadedContext
+from parlant.core.engines.alpha.engine_context import EngineContext
 from parlant.core.engines.alpha.message_event_composer import (
     MessageCompositionError,
     MessageEventComposer,
@@ -47,8 +49,8 @@ from parlant.core.engines.alpha.guideline_matching.guideline_match import Guidel
 from parlant.core.engines.alpha.prompt_builder import PromptBuilder
 from parlant.core.glossary import Term
 from parlant.core.emissions import EmittedEvent, EventEmitter
-from parlant.core.sessions import Event, EventKind, EventSource
-from parlant.core.common import CancellationSuppressionLatch, DefaultBaseModel
+from parlant.core.sessions import Event, EventKind, EventSource, Session
+from parlant.core.common import DefaultBaseModel
 from parlant.core.loggers import Logger
 from parlant.core.shots import Shot, ShotCollection
 from parlant.core.tools import ToolId
@@ -125,14 +127,22 @@ class MessageGenerator(MessageEventComposer):
     def __init__(
         self,
         logger: Logger,
-        correlator: ContextualCorrelator,
+        meter: Meter,
+        tracer: Tracer,
         optimization_policy: OptimizationPolicy,
         schematic_generator: SchematicGenerator[MessageSchema],
     ) -> None:
         self._logger = logger
-        self._correlator = correlator
+        self._meter = meter
+
+        self._tracer = tracer
         self._optimization_policy = optimization_policy
         self._schematic_generator = schematic_generator
+
+        self._hist_message_generation_duration = self._meter.create_duration_histogram(
+            "message_generation",
+            description="Duration of message generation requests",
+        )
 
     async def shots(self) -> Sequence[MessageGeneratorShot]:
         return await shot_collection.list()
@@ -140,35 +150,37 @@ class MessageGenerator(MessageEventComposer):
     @override
     async def generate_preamble(
         self,
-        context: LoadedContext,
+        context: EngineContext,
     ) -> Sequence[MessageEventComposition]:
         return []
 
     @override
     async def generate_response(
         self,
-        context: LoadedContext,
-        latch: Optional[CancellationSuppressionLatch] = None,
+        context: EngineContext,
+        latch: Optional[CancellationSuppressionLatch[None]] = None,
     ) -> Sequence[MessageEventComposition]:
         with self._logger.scope("MessageEventComposer"):
             with self._logger.scope("MessageGenerator"):
-                with self._logger.operation("Message generation"):
-                    return await self._do_generate_events(
-                        event_emitter=context.session_event_emitter,
-                        agent=context.agent,
-                        customer=context.customer,
-                        context_variables=context.state.context_variables,
-                        interaction_history=context.interaction.history,
-                        terms=list(context.state.glossary_terms),
-                        capabilities=context.state.capabilities,
-                        ordinary_guideline_matches=context.state.ordinary_guideline_matches,
-                        journeys=context.state.journeys,
-                        tool_enabled_guideline_matches=context.state.tool_enabled_guideline_matches,
-                        tool_insights=context.state.tool_insights,
-                        staged_tool_events=context.state.tool_events,
-                        staged_message_events=context.state.message_events,
-                        latch=latch,
-                    )
+                with self._logger.scope("Message generation"):
+                    async with self._hist_message_generation_duration.measure():
+                        return await self._do_generate_events(
+                            event_emitter=context.session_event_emitter,
+                            agent=context.agent,
+                            customer=context.customer,
+                            session=context.session,
+                            context_variables=context.state.context_variables,
+                            interaction_history=context.interaction.history,
+                            terms=list(context.state.glossary_terms),
+                            capabilities=context.state.capabilities,
+                            ordinary_guideline_matches=context.state.ordinary_guideline_matches,
+                            journeys=context.state.journeys,
+                            tool_enabled_guideline_matches=context.state.tool_enabled_guideline_matches,
+                            tool_insights=context.state.tool_insights,
+                            staged_tool_events=context.state.tool_events,
+                            staged_message_events=context.state.message_events,
+                            latch=latch,
+                        )
 
     def _format_staged_events(
         self,
@@ -189,6 +201,7 @@ class MessageGenerator(MessageEventComposer):
         event_emitter: EventEmitter,
         agent: Agent,
         customer: Customer,
+        session: Session,
         context_variables: Sequence[tuple[ContextVariable, ContextVariableValue]],
         interaction_history: Sequence[Event],
         terms: Sequence[Term],
@@ -199,7 +212,7 @@ class MessageGenerator(MessageEventComposer):
         tool_insights: ToolInsights,
         staged_tool_events: Sequence[EmittedEvent],
         staged_message_events: Sequence[EmittedEvent],
-        latch: Optional[CancellationSuppressionLatch] = None,
+        latch: Optional[CancellationSuppressionLatch[None]] = None,
     ) -> Sequence[MessageEventComposition]:
         if (
             not interaction_history
@@ -215,6 +228,7 @@ class MessageGenerator(MessageEventComposer):
             agent=agent,
             context_variables=context_variables,
             customer=customer,
+            session=session,
             interaction_history=interaction_history,
             terms=terms,
             ordinary_guideline_matches=ordinary_guideline_matches,
@@ -227,7 +241,7 @@ class MessageGenerator(MessageEventComposer):
         )
 
         await event_emitter.emit_status_event(
-            correlation_id=self._correlator.correlation_id,
+            trace_id=self._tracer.trace_id,
             data={
                 "status": "typing",
                 "data": {},
@@ -253,9 +267,11 @@ class MessageGenerator(MessageEventComposer):
 
                 if response_message is not None:
                     event = await event_emitter.emit_message_event(
-                        correlation_id=self._correlator.correlation_id,
+                        trace_id=self._tracer.trace_id,
                         data=response_message,
                     )
+
+                    self._tracer.add_event("mg.ttfm")
 
                     return [
                         MessageEventComposition({"message_generation": generation_info}, [event])
@@ -294,6 +310,7 @@ class MessageGenerator(MessageEventComposer):
         self,
         agent: Agent,
         customer: Customer,
+        session: Session,
         context_variables: Sequence[tuple[ContextVariable, ContextVariableValue]],
         interaction_history: Sequence[Event],
         terms: Sequence[Term],
@@ -327,7 +344,7 @@ Later in this prompt, you'll be provided with behavioral guidelines and other co
         )
 
         builder.add_agent_identity(agent)
-        builder.add_customer_identity(customer)
+        builder.add_customer_identity(customer, session)
         builder.add_section(
             name="message-generator-task-description",
             template="""

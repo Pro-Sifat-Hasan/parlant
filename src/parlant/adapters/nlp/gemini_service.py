@@ -27,23 +27,17 @@ from pydantic import BaseModel, Field, ValidationError
 from pydantic.fields import FieldInfo
 
 from parlant.core.common import DefaultBaseModel
-from parlant.core.engines.alpha.canned_response_generator import (
-    CannedResponseDraftSchema,
-    CannedResponseSelectionSchema,
-)
-from parlant.core.engines.alpha.guideline_matching.generic.journey_node_selection_batch import (
-    JourneyNodeSelectionSchema,
-)
+from parlant.adapters.nlp.common import record_llm_metrics
 from parlant.core.engines.alpha.prompt_builder import PromptBuilder
-from parlant.core.engines.alpha.tool_calling.single_tool_batch import SingleToolBatchSchema
+from parlant.core.meter import Meter
 from parlant.core.nlp.policies import policy, retry
 from parlant.core.nlp.tokenization import EstimatingTokenizer
 from parlant.core.nlp.moderation import ModerationService, NoModeration
-from parlant.core.nlp.service import NLPService
-from parlant.core.nlp.embedding import Embedder, EmbeddingResult
+from parlant.core.nlp.service import EmbedderHints, ModelSize, NLPService, SchematicGeneratorHints
+from parlant.core.nlp.embedding import BaseEmbedder, Embedder, EmbeddingResult
 from parlant.core.nlp.generation import (
     T,
-    SchematicGenerator,
+    BaseSchematicGenerator,
     FallbackSchematicGenerator,
     SchematicGenerationResult,
 )
@@ -72,7 +66,7 @@ class GoogleEstimatingTokenizer(EstimatingTokenizer):
     @override
     async def estimate_token_count(self, prompt: str) -> int:
         model_approximation = {
-            "text-embedding-004": "gemini-2.5-flash",
+            "gemini-embedding-001": "gemini-2.5-flash",
         }.get(self._model_name, self._model_name)
 
         result = await self._client.aio.models.count_tokens(
@@ -83,16 +77,16 @@ class GoogleEstimatingTokenizer(EstimatingTokenizer):
         return int(result.total_tokens or 0)
 
 
-class GeminiSchematicGenerator(SchematicGenerator[T]):
+class GeminiSchematicGenerator(BaseSchematicGenerator[T]):
     supported_hints = ["temperature", "thinking_config"]
 
     def __init__(
         self,
         model_name: str,
         logger: Logger,
+        meter: Meter,
     ) -> None:
-        self.model_name = model_name
-        self._logger = logger
+        super().__init__(logger, meter, model_name)
 
         self._client = google.genai.Client(api_key=os.environ.get("GEMINI_API_KEY"))
 
@@ -121,7 +115,15 @@ class GeminiSchematicGenerator(SchematicGenerator[T]):
         ]
     )
     @override
-    async def generate(
+    async def do_generate(
+        self,
+        prompt: str | PromptBuilder,
+        hints: Mapping[str, Any] = {},
+    ) -> SchematicGenerationResult[T]:
+        with self.logger.scope(f"Gemini LLM Request ({self.schema.__name__})"):
+            return await self._do_generate(prompt, hints)
+
+    async def _do_generate(
         self,
         prompt: str | PromptBuilder,
         hints: Mapping[str, Any] = {},
@@ -152,7 +154,7 @@ class GeminiSchematicGenerator(SchematicGenerator[T]):
                 config=config,
             )
         except TooManyRequests:
-            self._logger.error(RATE_LIMIT_ERROR_MESSAGE)
+            self.logger.error(RATE_LIMIT_ERROR_MESSAGE)
             raise
 
         t_end = time.time()
@@ -168,10 +170,25 @@ class GeminiSchematicGenerator(SchematicGenerator[T]):
         )
 
         if response.usage_metadata:
-            self._logger.trace(response.usage_metadata.model_dump_json(indent=2))
+            self.logger.trace(response.usage_metadata.model_dump_json(indent=2))
 
         try:
             model_content = self.schema.model_validate(json_result)
+
+            await record_llm_metrics(
+                self.meter,
+                self.model_name,
+                schema_name=self.schema.__name__,
+                input_tokens=response.usage_metadata.prompt_token_count or 0
+                if response.usage_metadata
+                else 0,
+                output_tokens=response.usage_metadata.candidates_token_count or 0
+                if response.usage_metadata
+                else 0,
+                cached_input_tokens=response.usage_metadata.cached_content_token_count or 0
+                if response.usage_metadata
+                else 0,
+            )
 
             return SchematicGenerationResult(
                 content=model_content,
@@ -184,7 +201,7 @@ class GeminiSchematicGenerator(SchematicGenerator[T]):
                         output_tokens=response.usage_metadata.candidates_token_count or 0,
                         extra={
                             "cached_input_tokens": (
-                                response.usage_metadata.cached_content_token_count
+                                response.usage_metadata.cached_content_token_count or 0
                                 if response.usage_metadata
                                 else 0
                             )
@@ -196,7 +213,7 @@ class GeminiSchematicGenerator(SchematicGenerator[T]):
                 ),
             )
         except ValidationError:
-            self._logger.error(
+            self.logger.error(
                 f"JSON content returned by {self.model_name} does not match expected schema:\n{json_result}"
             )
             raise
@@ -230,10 +247,11 @@ class GeminiSchematicGenerator(SchematicGenerator[T]):
 
 
 class Gemini_1_5_Flash(GeminiSchematicGenerator[T]):
-    def __init__(self, logger: Logger) -> None:
+    def __init__(self, logger: Logger, meter: Meter) -> None:
         super().__init__(
             model_name="gemini-1.5-flash",
             logger=logger,
+            meter=meter,
         )
 
     @property
@@ -243,10 +261,11 @@ class Gemini_1_5_Flash(GeminiSchematicGenerator[T]):
 
 
 class Gemini_2_0_Flash(GeminiSchematicGenerator[T]):
-    def __init__(self, logger: Logger) -> None:
+    def __init__(self, logger: Logger, meter: Meter) -> None:
         super().__init__(
             model_name="gemini-2.0-flash",
             logger=logger,
+            meter=meter,
         )
 
     @property
@@ -256,10 +275,11 @@ class Gemini_2_0_Flash(GeminiSchematicGenerator[T]):
 
 
 class Gemini_2_0_Flash_Lite(GeminiSchematicGenerator[T]):
-    def __init__(self, logger: Logger) -> None:
+    def __init__(self, logger: Logger, meter: Meter) -> None:
         super().__init__(
             model_name="gemini-2.0-flash-lite-preview-02-05",
             logger=logger,
+            meter=meter,
         )
 
     @property
@@ -269,10 +289,11 @@ class Gemini_2_0_Flash_Lite(GeminiSchematicGenerator[T]):
 
 
 class Gemini_1_5_Pro(GeminiSchematicGenerator[T]):
-    def __init__(self, logger: Logger) -> None:
+    def __init__(self, logger: Logger, meter: Meter) -> None:
         super().__init__(
             model_name="gemini-1.5-pro",
             logger=logger,
+            meter=meter,
         )
 
     @property
@@ -282,10 +303,36 @@ class Gemini_1_5_Pro(GeminiSchematicGenerator[T]):
 
 
 class Gemini_2_5_Flash(GeminiSchematicGenerator[T]):
-    def __init__(self, logger: Logger) -> None:
+    def __init__(self, logger: Logger, meter: Meter) -> None:
         super().__init__(
             model_name="gemini-2.5-flash",
             logger=logger,
+            meter=meter,
+        )
+
+    @override
+    async def generate(
+        self,
+        prompt: str | PromptBuilder,
+        hints: Mapping[str, Any] = {},
+    ) -> SchematicGenerationResult[T]:
+        return await super().generate(
+            prompt,
+            {"thinking_config": {"thinking_budget": 0}, **hints},
+        )
+
+    @property
+    @override
+    def max_tokens(self) -> int:
+        return 1024 * 1024
+
+
+class Gemini_2_5_Flash_Lite(GeminiSchematicGenerator[T]):
+    def __init__(self, logger: Logger, meter: Meter) -> None:
+        super().__init__(
+            model_name="gemini-2.5-flash-lite",
+            logger=logger,
+            meter=meter,
         )
 
     @override
@@ -306,10 +353,11 @@ class Gemini_2_5_Flash(GeminiSchematicGenerator[T]):
 
 
 class Gemini_2_5_Pro(GeminiSchematicGenerator[T]):
-    def __init__(self, logger: Logger) -> None:
+    def __init__(self, logger: Logger, meter: Meter) -> None:
         super().__init__(
             model_name="gemini-2.5-pro",
             logger=logger,
+            meter=meter,
         )
 
     @property
@@ -318,13 +366,12 @@ class Gemini_2_5_Pro(GeminiSchematicGenerator[T]):
         return 1024 * 1024
 
 
-class GoogleEmbedder(Embedder):
+class GoogleEmbedder(BaseEmbedder):
     supported_hints = ["title", "task_type"]
 
-    def __init__(self, model_name: str, logger: Logger) -> None:
-        self.model_name = model_name
+    def __init__(self, model_name: str, logger: Logger, meter: Meter) -> None:
+        super().__init__(logger, meter, model_name)
 
-        self._logger = logger
         self._client = google.genai.Client(api_key=os.environ.get("GEMINI_API_KEY"))
         self._tokenizer = GoogleEstimatingTokenizer(client=self._client, model_name=self.model_name)
 
@@ -351,7 +398,7 @@ class GoogleEmbedder(Embedder):
         ]
     )
     @override
-    async def embed(
+    async def do_embed(
         self,
         texts: list[str],
         hints: Mapping[str, Any] = {},
@@ -359,14 +406,13 @@ class GoogleEmbedder(Embedder):
         gemini_api_arguments = {k: v for k, v in hints.items() if k in self.supported_hints}
 
         try:
-            with self._logger.operation("Embedding text with gemini"):
-                response = await self._client.aio.models.embed_content(  # type: ignore
-                    model=self.model_name,
-                    contents=texts,  # type: ignore
-                    config=cast(google.genai.types.EmbedContentConfigDict, gemini_api_arguments),
-                )
+            response = await self._client.aio.models.embed_content(  # type: ignore
+                model=self.model_name,
+                contents=texts,  # type: ignore
+                config=cast(google.genai.types.EmbedContentConfigDict, gemini_api_arguments),
+            )
         except TooManyRequests:
-            self._logger.error(
+            self.logger.error(
                 (
                     "Google API rate limit exceeded. Possible reasons:\n"
                     "1. Your account may have insufficient API credits.\n"
@@ -387,18 +433,22 @@ class GoogleEmbedder(Embedder):
         return EmbeddingResult(vectors=vectors)
 
 
-class GeminiTextEmbedding_004(GoogleEmbedder):
-    def __init__(self, logger: Logger) -> None:
-        super().__init__(model_name="text-embedding-004", logger=logger)
+class GeminiTextEmbedding_001(GoogleEmbedder):
+    def __init__(self, logger: Logger, meter: Meter) -> None:
+        super().__init__(
+            model_name="gemini-embedding-001",
+            logger=logger,
+            meter=meter,
+        )
 
     @property
     @override
     def max_tokens(self) -> int:
-        return 8000
+        return 2048
 
     @property
     def dimensions(self) -> int:
-        return 768
+        return 3072
 
 
 class GeminiService(NLPService):
@@ -417,61 +467,34 @@ Please set GEMINI_API_KEY in your environment before running Parlant.
     def __init__(
         self,
         logger: Logger,
-        generative_model_name: str | list[str] | None = None,
+        meter: Meter,
     ) -> None:
-        self._logger = logger
-        self._generative_model_name = generative_model_name
-        self._logger.info("Initialized GeminiService")
+        self.logger = logger
+        self._meter = meter
 
-    def _get_generator_class_for_model(self, model_name: str):
-        """Returns the appropriate generator class for the given model name."""
-        model_mapping = {
-            "gemini-1.5-flash": Gemini_1_5_Flash,
-            "gemini-2.0-flash": Gemini_2_0_Flash,
-            "gemini-2.0-flash-lite-preview-02-05": Gemini_2_0_Flash_Lite,
-            "gemini-1.5-pro": Gemini_1_5_Pro,
-            "gemini-2.5-flash": Gemini_2_5_Flash,
-            "gemini-2.5-pro": Gemini_2_5_Pro,
-        }
-        
-        # Check if it's a known model
-        if model_name in model_mapping:
-            return model_mapping[model_name]
-        else:
-            # For unknown models, create a dynamic generator
-            self._logger.warning(
-                f"Unrecognized model name '{model_name}'. Using Gemini_2_5_Flash as fallback."
-            )
-            return Gemini_2_5_Flash
+        self.logger.info("Initialized GeminiService")
 
     @override
-    async def get_schematic_generator(self, t: type[T]) -> GeminiSchematicGenerator[T]:
-        if self._generative_model_name:
-            # If specific model(s) requested, use the first one (simple approach)
-            model_name = (
-                self._generative_model_name[0] 
-                if isinstance(self._generative_model_name, list) 
-                else self._generative_model_name
-            )
-            generator_class = self._get_generator_class_for_model(model_name)
-            # Use the same schema-specific mapping structure with the custom model
-            return {
-                SingleToolBatchSchema: generator_class[SingleToolBatchSchema],
-                JourneyNodeSelectionSchema: generator_class[JourneyNodeSelectionSchema],
-                CannedResponseDraftSchema: generator_class[CannedResponseDraftSchema],
-                CannedResponseSelectionSchema: generator_class[CannedResponseSelectionSchema],
-            }.get(t, generator_class[t])(self._logger)  # type: ignore
-        else:
-            # Default behavior - use fallback with Gemini_2_5_Flash and Gemini_2_5_Pro
-            return FallbackSchematicGenerator[t](  # type: ignore
-                Gemini_2_5_Flash[t](self._logger),  # type: ignore
-                Gemini_2_5_Pro[t](self._logger),  # type: ignore
-                logger=self._logger,
-            )
+    async def get_schematic_generator(
+        self, t: type[T], hints: SchematicGeneratorHints = {}
+    ) -> GeminiSchematicGenerator[T]:
+        match hints.get("model_size", ModelSize.AUTO):
+            case ModelSize.NANO:
+                return Gemini_2_5_Flash_Lite[t](self.logger, self._meter)  # type: ignore
+            case ModelSize.MINI:
+                return Gemini_2_5_Flash[t](self.logger, self._meter)  # type: ignore
+            case ModelSize.LARGE:
+                return Gemini_2_5_Pro[t](self.logger, self._meter)  # type: ignore
+            case _:
+                return FallbackSchematicGenerator[t](  # type: ignore
+                    Gemini_2_5_Flash[t](self.logger, self._meter),  # type: ignore
+                    Gemini_2_5_Pro[t](self.logger, self._meter),  # type: ignore
+                    logger=self.logger,
+                )
 
     @override
-    async def get_embedder(self) -> Embedder:
-        return GeminiTextEmbedding_004(self._logger)
+    async def get_embedder(self, hints: EmbedderHints = {}) -> Embedder:
+        return GeminiTextEmbedding_001(self.logger, self._meter)
 
     @override
     async def get_moderation_service(self) -> ModerationService:

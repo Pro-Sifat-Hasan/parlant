@@ -314,9 +314,12 @@ class Actions:
     ) -> list[Session]:
         client = cast(ParlantClient, ctx.obj.client)
 
-        return client.sessions.list(
-            agent_id=agent_id,
-            customer_id=customer_id,
+        return cast(
+            list[Session],
+            client.sessions.list(
+                agent_id=agent_id,
+                customer_id=customer_id,
+            ),
         )
 
     @staticmethod
@@ -991,7 +994,7 @@ class Actions:
         ctx: click.Context,
     ) -> list[Customer]:
         client = cast(ParlantClient, ctx.obj.client)
-        return client.customers.list()
+        return cast(list[Customer], client.customers.list())
 
     @staticmethod
     def create_customer(
@@ -1690,7 +1693,7 @@ class Interface:
             {
                 "Event ID": e.id,
                 "Creation Date": reformat_datetime(e.creation_utc),
-                "Correlation ID": e.correlation_id,
+                "Trace ID": e.trace_id,
                 "Source": e.source,
                 "Offset": e.offset,
                 "Kind": e.kind,
@@ -3209,8 +3212,8 @@ class Interface:
             for log in Actions.stream_logs(ctx, union_patterns, intersection_patterns):
                 level = log.get("level", "")
                 message = log.get("message", "")
-                correlation_id = log.get("correlation_id", "")
-                rich.print(f"[{level}] [{correlation_id}] {message}")
+                trace_id = log.get("trace_id", "")
+                rich.print(f"[{level}] [{trace_id}] {message}")
         except Exception as e:
             Interface.write_error(f"Error while streaming logs: {e}")
             set_exit_status(1)

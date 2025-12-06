@@ -20,7 +20,7 @@ from typing import Mapping, Sequence
 from lagom import Container
 from pytest import fixture
 from parlant.core.agents import Agent
-from parlant.core.common import generate_id
+from parlant.core.common import Criticality, generate_id
 from parlant.core.customers import Customer
 from parlant.core.emissions import EmittedEvent
 from parlant.core.engines.alpha.guideline_matching.generic.response_analysis_batch import (
@@ -34,6 +34,7 @@ from parlant.core.engines.alpha.guideline_matching.guideline_matcher import (
 from parlant.core.engines.alpha.optimization_policy import OptimizationPolicy
 from parlant.core.guidelines import Guideline, GuidelineContent, GuidelineId
 from parlant.core.loggers import Logger
+from parlant.core.meter import Meter
 from parlant.core.nlp.generation import SchematicGenerator
 from parlant.core.sessions import EventSource, Session, SessionId, SessionStore
 from parlant.core.tags import TagId
@@ -141,6 +142,7 @@ def create_guideline(
             condition=condition,
             action=action,
         ),
+        criticality=Criticality.MEDIUM,
         enabled=True,
         tags=tags,
         metadata={},
@@ -165,6 +167,7 @@ def create_guideline_with_tools(
             condition=condition,
             action=action,
         ),
+        criticality=Criticality.MEDIUM,
         enabled=True,
         tags=tags,
         metadata={},
@@ -208,7 +211,7 @@ async def base_test_that_correct_guidelines_are_detected_as_previously_applied(
             session_id=session_id,
             source=e.source,
             kind=e.kind,
-            correlation_id=e.correlation_id,
+            trace_id=e.trace_id,
             data=e.data,
         )
 
@@ -225,6 +228,7 @@ async def base_test_that_correct_guidelines_are_detected_as_previously_applied(
 
     response_analysis = GenericResponseAnalysisBatch(
         logger=context.container[Logger],
+        meter=context.container[Meter],
         optimization_policy=context.container[OptimizationPolicy],
         schematic_generator=context.container[SchematicGenerator[GenericResponseAnalysisSchema]],
         context=ResponseAnalysisContext(

@@ -41,7 +41,9 @@ from pathlib import Path
 import sys
 import uvicorn
 
+
 from parlant.adapters.loggers.websocket import WebSocketLogger
+from parlant.adapters.vector_db.transient import TransientVectorDatabase
 from parlant.api.authorization import (
     AuthorizationPolicy,
     DevelopmentAuthorizationPolicy,
@@ -105,6 +107,7 @@ from parlant.core.engines.alpha.optimization_policy import (
 from parlant.core.engines.alpha.perceived_performance_policy import (
     BasicPerceivedPerformancePolicy,
     PerceivedPerformancePolicy,
+    PerceivedPerformancePolicyProvider,
 )
 from parlant.core.engines.alpha.relational_guideline_resolver import RelationalGuidelineResolver
 from parlant.core.engines.alpha.tool_calling.overlapping_tools_batch import (
@@ -123,6 +126,7 @@ from parlant.core.engines.alpha.canned_response_generator import (
     NoMatchResponseProvider,
 )
 from parlant.core.journey_guideline_projection import JourneyGuidelineProjection
+from parlant.core.meter import Meter, NullMeter
 from parlant.core.services.indexing.guideline_agent_intention_proposer import (
     AgentIntentionProposerSchema,
 )
@@ -152,7 +156,7 @@ from parlant.core.shots import ShotCollection
 from parlant.core.tags import TagDocumentStore, TagStore
 from parlant.api.app import create_api_app, ASGIApplication
 from parlant.core.background_tasks import BackgroundTaskService
-from parlant.core.contextual_correlator import ContextualCorrelator
+from parlant.core.tracer import LocalTracer, Tracer
 from parlant.core.agents import AgentDocumentStore, AgentStore
 from parlant.core.context_variables import ContextVariableDocumentStore, ContextVariableStore
 from parlant.core.emission.event_publisher import EventPublisherFactory
@@ -240,11 +244,8 @@ DEFAULT_AGENT_NAME = "Default Agent"
 sys.path.append(PARLANT_HOME_DIR.as_posix())
 sys.path.append(".")
 
-CORRELATOR = ContextualCorrelator()
-
-LOGGER = FileLogger(PARLANT_HOME_DIR / "parlant.log", CORRELATOR, LogLevel.INFO)
-
-BACKGROUND_TASK_SERVICE = BackgroundTaskService(LOGGER)
+TRACER = LocalTracer()
+LOGGER = FileLogger(PARLANT_HOME_DIR / "parlant.log", TRACER, LogLevel.INFO)
 
 
 class StartupError(Exception):
@@ -262,6 +263,7 @@ NLPServiceName = Literal[
     "openai",
     "together",
     "litellm",
+    "modelscope",
 ]
 
 
@@ -277,11 +279,17 @@ class StartupParameters:
     initialize: Callable[[Container], Awaitable[None]] | None = None
 
 
-def load_nlp_service(name: str, extra_name: str, class_name: str, module_path: str) -> NLPService:
+def load_nlp_service(
+    container: Container,
+    name: str,
+    extra_name: str,
+    class_name: str,
+    module_path: str,
+) -> NLPService:
     try:
         module = importlib.import_module(module_path)
         service = getattr(module, class_name)
-        return cast(NLPService, service(LOGGER))
+        return cast(NLPService, service(LOGGER, container[Meter]))
     except ModuleNotFoundError as exc:
         LOGGER.error(f"Failed to import module: {exc.name}")
         LOGGER.critical(
@@ -290,59 +298,91 @@ def load_nlp_service(name: str, extra_name: str, class_name: str, module_path: s
         sys.exit(1)
 
 
-def load_anthropic() -> NLPService:
+def load_anthropic(container: Container) -> NLPService:
     return load_nlp_service(
-        "Anthropic", "anthropic", "AnthropicService", "parlant.adapters.nlp.anthropic_service"
+        container,
+        "Anthropic",
+        "anthropic",
+        "AnthropicService",
+        "parlant.adapters.nlp.anthropic_service",
     )
 
 
-def load_aws() -> NLPService:
-    return load_nlp_service("AWS", "aws", "BedrockService", "parlant.adapters.nlp.aws_service")
+def load_aws(container: Container) -> NLPService:
+    return load_nlp_service(
+        container, "AWS", "aws", "BedrockService", "parlant.adapters.nlp.aws_service"
+    )
 
 
-def load_azure() -> NLPService:
+def load_azure(container: Container) -> NLPService:
     from parlant.adapters.nlp.azure_service import AzureService
 
-    return AzureService(LOGGER)
+    return AzureService(LOGGER, container[Meter])
 
 
-def load_cerebras() -> NLPService:
+def load_cerebras(container: Container) -> NLPService:
     return load_nlp_service(
-        "Cerebras", "cerebras", "CerebrasService", "parlant.adapters.nlp.cerebras_service"
+        container,
+        "Cerebras",
+        "cerebras",
+        "CerebrasService",
+        "parlant.adapters.nlp.cerebras_service",
     )
 
 
-def load_deepseek() -> NLPService:
+def load_deepseek(container: Container) -> NLPService:
     return load_nlp_service(
-        "DeepSeek", "deepseek", "DeepSeekService", "parlant.adapters.nlp.deepseek_service"
+        container,
+        "DeepSeek",
+        "deepseek",
+        "DeepSeekService",
+        "parlant.adapters.nlp.deepseek_service",
     )
 
 
-def load_gemini() -> NLPService:
+def load_modelscope(container: Container) -> NLPService:
     return load_nlp_service(
-        "Gemini", "gemini", "GeminiService", "parlant.adapters.nlp.gemini_service"
+        container,
+        "ModelScope",
+        "modelscope",
+        "ModelScopeService",
+        "parlant.adapters.nlp.modelscope_service",
     )
 
 
-def load_openai() -> NLPService:
+def load_gemini(container: Container) -> NLPService:
+    return load_nlp_service(
+        container, "Gemini", "gemini", "GeminiService", "parlant.adapters.nlp.gemini_service"
+    )
+
+
+def load_openai(container: Container) -> NLPService:
     from parlant.adapters.nlp.openai_service import OpenAIService
 
-    return OpenAIService(LOGGER)
+    return OpenAIService(LOGGER, container[Meter])
 
 
-def load_together() -> NLPService:
+def load_together(container: Container) -> NLPService:
     return load_nlp_service(
-        "Together.ai", "together", "TogetherService", "parlant.adapters.nlp.together_service"
+        container,
+        "Together.ai",
+        "together",
+        "TogetherService",
+        "parlant.adapters.nlp.together_service",
     )
 
 
-def load_litellm() -> NLPService:
+def load_litellm(container: Container) -> NLPService:
     return load_nlp_service(
-        "LiteLLM", "litellm", "LiteLLMService", "parlant.adapters.nlp.litellm_service"
+        container,
+        "LiteLLM",
+        "litellm",
+        "LiteLLMService",
+        "parlant.adapters.nlp.litellm_service",
     )
 
 
-NLP_SERVICE_INITIALIZERS: dict[NLPServiceName, Callable[[], NLPService]] = {
+NLP_SERVICE_INITIALIZERS: dict[NLPServiceName, Callable[[Container], NLPService]] = {
     "anthropic": load_anthropic,
     "aws": load_aws,
     "azure": load_azure,
@@ -352,6 +392,7 @@ NLP_SERVICE_INITIALIZERS: dict[NLPServiceName, Callable[[], NLPService]] = {
     "openai": load_openai,
     "together": load_together,
     "litellm": load_litellm,
+    "modelscope": load_modelscope,
 }
 
 
@@ -402,6 +443,44 @@ async def load_modules(
                 await shutdown_module()
 
 
+async def _define_logger(container: Container) -> None:
+    if os.environ.get("OTEL_EXPORTER_OTLP_LOGS_ENDPOINT"):
+        from parlant.adapters.loggers.opentelemetry import OpenTelemetryLogger
+
+        print("OpenTelemetry logging is enabled.")
+        container[Logger] = CompositeLogger(
+            [
+                await EXIT_STACK.enter_async_context(OpenTelemetryLogger(container[Tracer])),
+                container[WebSocketLogger],
+            ]
+        )
+
+    else:
+        container[Logger] = CompositeLogger([LOGGER, container[WebSocketLogger]])
+
+
+async def _define_tracer(container: Container) -> None:
+    if os.environ.get("OTEL_EXPORTER_OTLP_TRACES_ENDPOINT"):
+        from parlant.adapters.tracing.opentelemetry import OpenTelemetryTracer
+
+        print("OpenTelemetry tracing is enabled.")
+        container[Tracer] = await EXIT_STACK.enter_async_context(OpenTelemetryTracer())
+
+    else:
+        _define_singleton(container, Tracer, LocalTracer)
+
+
+async def _define_meter(container: Container) -> None:
+    if os.environ.get("OTEL_EXPORTER_OTLP_METRICS_ENDPOINT"):
+        from parlant.adapters.meter.opentelemetry import OpenTelemetryMeter
+
+        print("OpenTelemetry metrics is enabled.")
+        container[Meter] = await EXIT_STACK.enter_async_context(OpenTelemetryMeter())
+
+    else:
+        _define_singleton(container, Meter, NullMeter)
+
+
 def _define_singleton(container: Container, interface: type, implementation: type) -> None:
     try:
         container[implementation] = Singleton(implementation)
@@ -440,11 +519,13 @@ def _define_singleton_value(container: Container, interface: type, implementatio
 async def setup_container() -> AsyncIterator[Container]:
     c = Container()
 
-    c[BackgroundTaskService] = BACKGROUND_TASK_SERVICE
-    c[ContextualCorrelator] = CORRELATOR
-    web_socket_logger = WebSocketLogger(CORRELATOR, LogLevel.INFO)
+    await _define_tracer(c)
+    web_socket_logger = WebSocketLogger(c[Tracer], LogLevel.INFO)
     c[WebSocketLogger] = web_socket_logger
-    c[Logger] = CompositeLogger([LOGGER, web_socket_logger])
+
+    await _define_logger(c)
+    await _define_meter(c)
+    _define_singleton(c, BackgroundTaskService, BackgroundTaskService)
 
     _define_singleton(c, IdGenerator, IdGenerator)
 
@@ -491,6 +572,7 @@ async def setup_container() -> AsyncIterator[Container]:
     _define_singleton(c, NoMatchResponseProvider, BasicNoMatchResponseProvider)
     _define_singleton(c, MessageGenerator, MessageGenerator)
     _define_singleton(c, PerceivedPerformancePolicy, BasicPerceivedPerformancePolicy)
+    _define_singleton(c, PerceivedPerformancePolicyProvider, PerceivedPerformancePolicyProvider)
     _define_singleton(c, OptimizationPolicy, BasicOptimizationPolicy)
 
     _define_singleton(c, GuidelineActionProposer, GuidelineActionProposer)
@@ -648,7 +730,7 @@ async def initialize_container(
 
     if isinstance(nlp_service_descriptor, str):
         nlp_service_name = nlp_service_descriptor
-        nlp_service_instance = NLP_SERVICE_INITIALIZERS[nlp_service_name]()
+        nlp_service_instance = NLP_SERVICE_INITIALIZERS[nlp_service_name](c)
     else:
         nlp_service_instance = await nlp_service_descriptor(c)
         nlp_service_name = nlp_service_instance.__class__.__name__
@@ -684,7 +766,7 @@ async def initialize_container(
                     database=db,
                     event_emitter_factory=c[EventEmitterFactory],
                     logger=c[Logger],
-                    correlator=c[ContextualCorrelator],
+                    tracer=c[Tracer],
                     nlp_services_provider=lambda: {nlp_service_name: nlp_service_instance},
                     allow_migration=migrate,
                 )
@@ -695,8 +777,6 @@ async def initialize_container(
         try_define(NLPService, nlp_service_instance)
 
         embedder_factory = EmbedderFactory(c)
-
-        shared_chroma_db: VectorDatabase | None = None
 
         if c[OptimizationPolicy].use_embedding_cache():
             c[EmbeddingCache] = BasicEmbeddingCache(
@@ -710,20 +790,12 @@ async def initialize_container(
         else:
             c[EmbeddingCache] = NullEmbeddingCache()
 
-        async def get_shared_chroma_db() -> VectorDatabase:
-            nonlocal shared_chroma_db
-            if shared_chroma_db is None:
-                from parlant.adapters.vector_db.chroma import ChromaDatabase
-
-                shared_chroma_db = await EXIT_STACK.enter_async_context(
-                    ChromaDatabase(
-                        c[Logger],
-                        PARLANT_HOME_DIR,
-                        embedder_factory,
-                        lambda: c[EmbeddingCache],
-                    ),
-                )
-            return cast(VectorDatabase, shared_chroma_db)
+        async def get_transient_vector_db() -> VectorDatabase:
+            return TransientVectorDatabase(
+                c[Logger],
+                embedder_factory,
+                lambda: c[EmbeddingCache],
+            )
 
         async def get_embedder_type() -> type[Embedder]:
             return type(await nlp_service_instance.get_embedder())
@@ -737,7 +809,7 @@ async def initialize_container(
             await try_define_vector_store(
                 store_interface,
                 store_implementation,
-                lambda: get_shared_chroma_db(),
+                lambda: get_transient_vector_db(),
                 document_db_filename,
                 get_embedder_type,
                 embedder_factory,
@@ -781,7 +853,7 @@ async def initialize_container(
         if os.environ.get("PARLANT_DATA_COLLECTION", "false").lower() not in ["false", "no", "0"]:
             generator = DataCollectingSchematicGenerator[schema](  # type: ignore
                 generator,
-                c[ContextualCorrelator],
+                c[Tracer],
             )
 
         try_define(
@@ -927,7 +999,7 @@ async def serve_app(
         await server.serve()
         await asyncio.sleep(0)  # Required to trigger the possible cancellation error
     except (KeyboardInterrupt, asyncio.CancelledError):
-        await BACKGROUND_TASK_SERVICE.cancel_all(reason="Server shutting down")
+        await container[BackgroundTaskService].cancel_all(reason="Server shutting down")
     except BaseException as e:
         LOGGER.critical(traceback.format_exc())
         LOGGER.critical(e.__class__.__name__ + ": " + str(e))
@@ -1063,6 +1135,12 @@ def main() -> None:
         default=False,
     )
     @click.option(
+        "--modelscope",
+        is_flag=True,
+        help="Run with ModelScope. You must set the MODELSCOPE_API_KEY environment variable and install the extra package parlant[modelscope].",
+        default=False,
+    )
+    @click.option(
         "--gemini",
         is_flag=True,
         help="Run with Gemini. The environment variable GEMINI_API_KEY must be set and install the extra package parlant[gemini].",
@@ -1132,6 +1210,7 @@ def main() -> None:
         cerebras: bool,
         together: bool,
         litellm: bool,
+        modelscope: bool,
         log_level: str,
         module: tuple[str],
         version: bool,
@@ -1141,12 +1220,28 @@ def main() -> None:
             print(f"Parlant v{VERSION}")
             sys.exit(0)
 
-        if sum([openai, aws, azure, deepseek, gemini, anthropic, cerebras, together, litellm]) > 2:
+        if (
+            sum(
+                [
+                    openai,
+                    aws,
+                    azure,
+                    deepseek,
+                    gemini,
+                    anthropic,
+                    cerebras,
+                    together,
+                    litellm,
+                    modelscope,
+                ]
+            )
+            > 2
+        ):
             print("error: only one NLP service profile can be selected")
             sys.exit(1)
 
         non_default_service_selected = any(
-            (aws, azure, deepseek, gemini, anthropic, cerebras, together, litellm)
+            (aws, azure, deepseek, gemini, anthropic, cerebras, together, litellm, modelscope)
         )
 
         if not non_default_service_selected:
@@ -1164,6 +1259,9 @@ def main() -> None:
         elif deepseek:
             nlp_service = "deepseek"
             require_env_keys(["DEEPSEEK_API_KEY"])
+        elif modelscope:
+            nlp_service = "modelscope"
+            require_env_keys(["MODELSCOPE_API_KEY"])
         elif anthropic:
             nlp_service = "anthropic"
             require_env_keys(["ANTHROPIC_API_KEY"])

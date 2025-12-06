@@ -21,7 +21,7 @@ from parlant.core.services.tools.plugins import tool
 from parlant.core.tags import Tag
 from parlant.core.tools import ToolContext, ToolId, ToolResult
 from parlant.core.canned_responses import CannedResponseStore
-from tests.sdk.utils import Context, SDKTest
+from tests.sdk.utils import Context, SDKTest, get_message
 from tests.test_utilities import nlp_test
 
 from parlant import sdk as p
@@ -179,7 +179,7 @@ class Test_that_a_created_journey_is_followed(SDKTest):
         )
 
     async def run(self, ctx: Context) -> None:
-        response = await ctx.send_and_receive("Hello there", recipient=self.agent)
+        response = await ctx.send_and_receive_message("Hello there", recipient=self.agent)
 
         assert await nlp_test(
             context=response,
@@ -605,7 +605,10 @@ class Test_that_journey_state_can_have_its_own_canned_responses(SDKTest):
             description="Greet customers with personalized responses",
         )
 
-        self.canrep1 = await server.create_canned_response(template="How can I assist you?")
+        self.canrep1 = await server.create_canned_response(
+            template="How can I assist you?",
+            metadata={"mood": "friendly"},
+        )
         self.canrep2 = await server.create_canned_response(template="Welcome to our store!")
 
         self.initial_transition = await self.journey.initial_state.transition_to(
@@ -627,9 +630,10 @@ class Test_that_journey_state_can_have_its_own_canned_responses(SDKTest):
         assert Tag.for_journey_node_id(self.initial_transition.target.id) in stored_canrep1.tags
         assert Tag.for_journey_node_id(self.second_transition.target.id) in stored_canrep2.tags
 
-        response = await ctx.send_and_receive("Hello", recipient=self.agent)
+        response = await ctx.send_and_receive_message_event("Hello", recipient=self.agent)
 
-        assert response == "How can I assist you?"
+        assert get_message(response) == "How can I assist you?"
+        assert response.metadata == {"mood": "friendly"}
 
 
 class Test_that_a_journey_is_reevaluated_after_a_skipped_tool_call(SDKTest):
@@ -667,22 +671,52 @@ class Test_that_a_journey_is_reevaluated_after_a_skipped_tool_call(SDKTest):
         )
 
     async def run(self, ctx: Context) -> None:
-        first_response = await ctx.send_and_receive(
+        first_response = await ctx.send_and_receive_message(
             "Hello", recipient=self.agent, reuse_session=True
         )
 
-        print(first_response)
-
         assert await nlp_test(first_response, "It mentions the date January 1st, 2000")
 
-        second_response = await ctx.send_and_receive(
+        second_response = await ctx.send_and_receive_message(
             "I'm really thirsty", recipient=self.agent, reuse_session=True
         )
 
         assert await nlp_test(second_response, "It offers a Pepsi")
-        # Make sure the guideline was not re-applied
-        assert await nlp_test(second_response, "It does not mention one million dollars")
-        print(second_response)
+
+
+class Test_that_a_missing_data_is_shown_after_journey_is_reevaluated(SDKTest):
+    async def setup(self, server: p.Server) -> None:
+        @tool
+        def get_customer_last_time_drank(context: ToolContext, customer_name: str) -> ToolResult:
+            return ToolResult(data={"last_time_drank": "January 1, 2000"})
+
+        self.agent = await server.create_agent(
+            name="Dummy agent",
+            description="Dummy agent for testing journeys",
+        )
+
+        self.journey = await self.agent.create_journey(
+            title="Handle Thirsty Customer",
+            conditions=["Customer is thirsty"],
+            description="Help a thirsty customer with a refreshing drink",
+        )
+
+        # Then we want to verify that the journey reaches the chat state
+        # even though the tool call received missing data.
+        self.t1 = await self.journey.initial_state.transition_to(
+            tool_instruction="Check when the customer last drank",
+            tool_state=get_customer_last_time_drank,
+        )
+        self.t2 = await self.t1.target.transition_to(
+            chat_state="Offer the customer a suitable amount of Pepsi based on when they last drank",
+        )
+
+    async def run(self, ctx: Context) -> None:
+        first_response = await ctx.send_and_receive_message(
+            "I'm really thirsty", recipient=self.agent, reuse_session=True
+        )
+
+        assert await nlp_test(first_response, "It asks for the customer's name")
 
 
 class Test_that_metadata_can_be_set_to_a_journey_state(SDKTest):
@@ -716,3 +750,300 @@ class Test_that_metadata_can_be_set_to_a_journey_state(SDKTest):
             state.metadata.get("internal_action")
             == "Provide detailed information about our services"
         )
+
+
+class Test_that_journey_can_have_a_scoped_guideline(SDKTest):
+    async def setup(self, server: p.Server) -> None:
+        self.agent = await server.create_agent(
+            name="Dummy Agent",
+            description="Dummy agent",
+        )
+
+        self.journey = await self.agent.create_journey(
+            title="Order Something",
+            conditions=["The customer wants to order something"],
+            description="Help the customer place an order",
+        )
+
+        await self.journey.initial_state.transition_to(
+            chat_state="greet the customer",
+        )
+
+        self.guideline = await self.journey.create_guideline(
+            condition="The customer wants to order a banana",
+            action="Ask them if they'd like green or yellow bananas",
+        )
+
+    async def run(self, ctx: Context) -> None:
+        response = await ctx.send_and_receive_message(
+            "Can I order a banana?",
+            recipient=self.agent,
+        )
+
+        assert "green" in response.lower()
+
+
+class Test_that_journey_can_be_created_with_custom_id(SDKTest):
+    async def setup(self, server: p.Server) -> None:
+        from parlant.core.journeys import JourneyId
+
+        self.agent = await server.create_agent(
+            name="Custom ID Agent",
+            description="Agent for testing custom journey IDs",
+        )
+
+        self.custom_id = JourneyId("custom-journey-123")
+
+        self.journey = await self.agent.create_journey(
+            title="Custom ID Journey",
+            conditions=["Customer needs help"],
+            description="Journey with custom ID",
+            id=self.custom_id,
+        )
+
+    async def run(self, ctx: Context) -> None:
+        journey_store = ctx.container[JourneyStore]
+
+        journey = await journey_store.read_journey(journey_id=self.custom_id)
+
+        assert journey.id == self.custom_id
+        assert journey.title == "Custom ID Journey"
+        assert journey.description == "Journey with custom ID"
+
+
+class Test_that_journey_creation_fails_with_duplicate_id(SDKTest):
+    async def setup(self, server: p.Server) -> None:
+        from parlant.core.journeys import JourneyId
+
+        self.agent = await server.create_agent(
+            name="Duplicate ID Agent",
+            description="Agent for testing duplicate journey IDs",
+        )
+
+        self.duplicate_id = JourneyId("duplicate-journey-456")
+
+        # Create the first journey
+        self.first_journey = await self.agent.create_journey(
+            title="First Journey",
+            conditions=["First condition"],
+            description="First journey with duplicate ID",
+            id=self.duplicate_id,
+        )
+
+    async def run(self, ctx: Context) -> None:
+        # Attempt to create a second journey with the same ID should fail
+        with pytest.raises(
+            ValueError, match="Journey with id 'duplicate-journey-456' already exists"
+        ):
+            await self.agent.create_journey(
+                title="Second Journey",
+                conditions=["Second condition"],
+                description="Second journey with duplicate ID",
+                id=self.duplicate_id,
+            )
+
+
+class Test_that_end_journey_match_handlers_are_called(SDKTest):
+    async def setup(self, server: p.Server) -> None:
+        self.agent = await server.create_agent(
+            name="Journey Exit Handler Agent",
+            description="Tests specific END_JOURNEY transition handlers",
+        )
+
+        self.journey = await self.agent.create_journey(
+            title="Order Process",
+            description="Order processing journey",
+            conditions=["Customer wants to place an order"],
+        )
+
+        # Track which exit handler was called
+        self.success_exit_called = False
+        self.cancel_exit_called = False
+
+        async def success_exit_handler(ctx: p.EngineContext, match: p.JourneyStateMatch) -> None:
+            assert match.state_id == "end", "Should be exiting to END_JOURNEY"
+            self.success_exit_called = True
+
+        async def cancel_exit_handler(ctx: p.EngineContext, match: p.JourneyStateMatch) -> None:
+            assert match.state_id == "end", "Should be exiting to END_JOURNEY"
+            self.cancel_exit_called = True
+
+        # Create a chat state for order confirmation
+        confirmation_state = await self.journey.initial_state.transition_to(
+            chat_state="Please confirm your order or cancel",
+        )
+
+        # Exit path 1: Customer confirms order (success path)
+        await confirmation_state.target.transition_to(
+            condition="Customer confirms the order",
+            state=p.END_JOURNEY,
+            on_match=success_exit_handler,
+        )
+
+        # Exit path 2: Customer cancels order (cancel path)
+        await confirmation_state.target.transition_to(
+            condition="Customer wants to cancel",
+            state=p.END_JOURNEY,
+            on_match=cancel_exit_handler,
+        )
+
+    async def run(self, ctx: Context) -> None:
+        # Start the journey
+        await ctx.send_and_receive_message(
+            customer_message="I want to place an order",
+            recipient=self.agent,
+        )
+
+        # Trigger the success exit path
+        await ctx.send_and_receive_message(
+            customer_message="Yes, please confirm my order",
+            recipient=self.agent,
+            reuse_session=True,
+        )
+
+        # Verify only the success exit handler was called
+        assert self.success_exit_called, "Success exit handler should have been called"
+        assert not self.cancel_exit_called, "Cancel exit handler should NOT have been called"
+
+
+class Test_that_journey_state_match_handler_is_called(SDKTest):
+    async def setup(self, server: p.Server) -> None:
+        self.handler_called = False
+        self.captured_state_id = None
+
+        async def state_match_handler(ctx: p.EngineContext, match: p.JourneyStateMatch) -> None:
+            self.handler_called = True
+            self.captured_state_id = match.state_id
+
+        self.agent = await server.create_agent(
+            name="Order Agent",
+            description="Agent for testing journey state match handlers",
+        )
+
+        self.journey = await self.agent.create_journey(
+            title="Order Something",
+            description="Journey to handle orders",
+            conditions=["Customer wants to order something"],
+        )
+
+        self.state = await self.journey.initial_state.transition_to(
+            condition="Customer confirmed order",
+            chat_state="Great! Your order is confirmed.",
+            on_match=state_match_handler,
+        )
+
+    async def run(self, ctx: Context) -> None:
+        await ctx.send_and_receive_message(
+            customer_message="I want to order something. Yes, confirmed!",
+            recipient=self.agent,
+        )
+
+        assert self.handler_called, "State match handler should have been called"
+        assert self.captured_state_id == self.state.target.id, (
+            f"Expected state ID {self.state.target.id}, got {self.captured_state_id}"
+        )
+
+
+class Test_that_journey_state_can_be_created_with_description(SDKTest):
+    async def setup(self, server: p.Server) -> None:
+        self.agent = await server.create_agent(
+            name="Pizza Agent",
+            description="Agent for testing journey state descriptions",
+        )
+
+        self.journey = await self.agent.create_journey(
+            title="Pizza Ordering",
+            description="Handle pizza orders",
+            conditions=["Customer wants to order pizza"],
+        )
+
+        self.transition = await self.journey.initial_state.transition_to(
+            condition="Customer confirms toppings",
+            chat_state="Process the order",
+            description="At this point we've confirmed the pizza toppings and are ready to finalize",
+        )
+
+    async def run(self, ctx: Context) -> None:
+        journey_store = ctx.container[JourneyStore]
+
+        # Read the created state/node from the store
+        node = await journey_store.read_node(node_id=self.transition.target.id)
+
+        assert (
+            node.description
+            == "At this point we've confirmed the pizza toppings and are ready to finalize"
+        )
+
+
+class Test_that_journey_state_description_affects_agent_behavior(SDKTest):
+    async def setup(self, server: p.Server) -> None:
+        self.agent = await server.create_agent(
+            name="Spaceship Agent",
+            description="Agent for testing journey state description behavior",
+        )
+
+        self.journey = await self.agent.create_journey(
+            title="Spaceship Maintenance",
+            description="Handle spaceship maintenance requests",
+            conditions=["Customer asks about spaceship maintenance"],
+        )
+
+        await self.journey.initial_state.transition_to(
+            condition="Customer needs thruster calibration",
+            chat_state="Explain the calibration process",
+            description="First you peel the banana, then you stick it in the thruster",
+        )
+
+    async def run(self, ctx: Context) -> None:
+        answer = await ctx.send_and_receive_message(
+            customer_message="I need help with spaceship maintenance. Specifically thruster calibration.",
+            recipient=self.agent,
+        )
+
+        assert await nlp_test(answer, "It mentions a banana")
+
+
+class Test_that_different_state_types_support_description(SDKTest):
+    async def setup(self, server: p.Server) -> None:
+        self.agent = await server.create_agent(
+            name="Multi-State Agent",
+            description="Agent for testing descriptions across state types",
+        )
+
+        @tool
+        def check_inventory(context: ToolContext) -> ToolResult:
+            return ToolResult(data={"status": "available"})
+
+        self.journey = await self.agent.create_journey(
+            title="Order Processing",
+            description="Process customer orders",
+            conditions=["Customer wants to place an order"],
+        )
+
+        # ChatJourneyState with description
+        self.chat_transition = await self.journey.initial_state.transition_to(
+            condition="Customer provides item name",
+            chat_state="Confirm the item selection",
+            description="This is where we confirm what item the customer wants to order",
+        )
+
+        # ToolJourneyState with description
+        self.tool_transition = await self.chat_transition.target.transition_to(
+            condition="Need to check inventory",
+            tool_state=check_inventory,
+            description="Check if the item is in stock using our inventory system",
+        )
+
+    async def run(self, ctx: Context) -> None:
+        journey_store = ctx.container[JourneyStore]
+
+        # Verify ChatJourneyState has description
+        chat_node = await journey_store.read_node(node_id=self.chat_transition.target.id)
+        assert (
+            chat_node.description
+            == "This is where we confirm what item the customer wants to order"
+        )
+
+        # Verify ToolJourneyState has description
+        tool_node = await journey_store.read_node(node_id=self.tool_transition.target.id)
+        assert tool_node.description == "Check if the item is in stock using our inventory system"

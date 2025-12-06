@@ -21,8 +21,9 @@ from pytest import fixture
 
 from parlant.core.agents import Agent
 from parlant.core.capabilities import Capability, CapabilityId
-from parlant.core.common import JSONSerializable, generate_id
-from parlant.core.contextual_correlator import ContextualCorrelator
+from parlant.core.common import Criticality, JSONSerializable, generate_id
+from parlant.core.meter import Meter
+from parlant.core.tracer import Tracer
 from parlant.core.customers import Customer
 from parlant.core.emission.event_buffer import EventBuffer
 from parlant.core.engines.alpha.guideline_matching.generic.response_analysis_batch import (
@@ -34,7 +35,7 @@ from parlant.core.engines.alpha.guideline_matching.guideline_matcher import (
     GuidelineMatcher,
     ResponseAnalysisContext,
 )
-from parlant.core.engines.alpha.loaded_context import Interaction, LoadedContext, ResponseState
+from parlant.core.engines.alpha.engine_context import Interaction, EngineContext, ResponseState
 from parlant.core.engines.alpha.optimization_policy import OptimizationPolicy
 from parlant.core.engines.alpha.tool_calling.tool_caller import ToolInsights
 from parlant.core.engines.types import Context
@@ -112,13 +113,13 @@ def match_guidelines(
 ) -> Sequence[GuidelineMatch]:
     session = context.sync_await(context.container[SessionStore].read_session(session_id))
 
-    loaded_context = LoadedContext(
+    loaded_context = EngineContext(
         info=Context(
             session_id=session.id,
             agent_id=agent.id,
         ),
         logger=context.logger,
-        correlator=context.container[ContextualCorrelator],
+        tracer=context.container[Tracer],
         agent=agent,
         customer=customer,
         session=session,
@@ -189,6 +190,7 @@ def create_guideline(
             condition=condition,
             action=action,
         ),
+        criticality=Criticality.MEDIUM,
         enabled=True,
         tags=[],
         metadata=metadata,
@@ -229,7 +231,7 @@ def update_previously_applied_guidelines(
                 agent_states=list(session.agent_states)
                 + [
                     AgentState(
-                        correlation_id="<main>",
+                        trace_id="<main>",
                         applied_guideline_ids=applied_guideline_ids,
                         journey_paths={},
                     )
@@ -266,6 +268,7 @@ def analyze_response_and_update_session(
 
     generic_response_analysis_batch = GenericResponseAnalysisBatch(
         logger=context.container[Logger],
+        meter=context.container[Meter],
         optimization_policy=context.container[OptimizationPolicy],
         schematic_generator=context.container[SchematicGenerator[GenericResponseAnalysisSchema]],
         context=ResponseAnalysisContext(

@@ -13,6 +13,10 @@
 # limitations under the License.
 
 import pytest
+from parlant.core.engines.alpha.hooks import EngineHooks
+from parlant.core.engines.alpha.guideline_matching.guideline_match import (
+    GuidelineMatch as _GuidelineMatch,
+)
 from parlant.core.guidelines import GuidelineStore
 from parlant.core.relationships import RelationshipKind, RelationshipStore
 from parlant.core.services.tools.plugins import tool
@@ -21,6 +25,7 @@ from parlant.core.tools import ToolContext, ToolResult
 from parlant.core.canned_responses import CannedResponseStore
 import parlant.sdk as p
 from tests.sdk.utils import Context, SDKTest
+from tests.test_utilities import nlp_test
 
 
 class Test_that_guideline_priority_relationship_can_be_created(SDKTest):
@@ -309,3 +314,425 @@ class Test_that_agent_guideline_can_be_created_with_metadata(SDKTest):
 
         assert guideline.metadata["continuous"] is True
         assert guideline.metadata["agent_intention_condition"] == "Test another property"
+
+
+class Test_that_guideline_can_use_custom_matcher(SDKTest):
+    async def setup(self, server: p.Server) -> None:
+        self.agent = await server.create_agent(
+            name="Dummy Agent",
+            description="Dummy agent",
+        )
+
+        self.guideline = await self.agent.create_guideline(
+            condition="",
+            action="Offer a banana",
+            matcher=p.Guideline.MATCH_ALWAYS,
+        )
+
+    async def run(self, ctx: Context) -> None:
+        answer = await ctx.send_and_receive_message(
+            customer_message="Hello, sir.",
+            recipient=self.agent,
+        )
+
+        assert await nlp_test(answer, "It offers a banana")
+
+
+class Test_that_custom_matcher_can_return_no_match(SDKTest):
+    async def setup(self, server: p.Server) -> None:
+        self.agent = await server.create_agent(
+            name="Dummy Agent",
+            description="Dummy agent",
+        )
+
+        async def never_match(
+            ctx: p.GuidelineMatchingContext, guideline: p.Guideline
+        ) -> p.GuidelineMatch:
+            return p.GuidelineMatch(
+                id=guideline.id,
+                matched=False,
+                rationale="Custom matcher never matches",
+            )
+
+        self.guideline = await self.agent.create_guideline(
+            condition="Customer greets you",
+            action="Offer a banana",
+            matcher=never_match,
+        )
+
+    async def run(self, ctx: Context) -> None:
+        answer = await ctx.send_and_receive_message(
+            customer_message="Hello there!",
+            recipient=self.agent,
+        )
+
+        assert not await nlp_test(answer, "It mentions a banana")
+
+
+class Test_that_guideline_description_affects_agent_behavior(SDKTest):
+    async def setup(self, server: p.Server) -> None:
+        self.agent = await server.create_agent(
+            name="Dummy Agent",
+            description="Dummy agent",
+        )
+
+        self.guideline = await self.agent.create_guideline(
+            condition="Customer asks about Cachookas",
+            action="Explain what Cachookas are",
+            description="Cachookas are a type of ancient boomerang used to repel flies",
+        )
+
+    async def run(self, ctx: Context) -> None:
+        answer = await ctx.send_and_receive_message(
+            customer_message="What are Cachookas?",
+            recipient=self.agent,
+        )
+
+        assert await nlp_test(answer, "It mentions the concept of a boomerang")
+
+
+class Test_that_guideline_match_handler_is_called_when_guideline_matches(SDKTest):
+    async def setup(self, server: p.Server) -> None:
+        self.agent = await server.create_agent(
+            name="Match Handler Agent",
+            description="Agent for testing match handlers",
+        )
+
+        self.captured_guideline_id = None
+
+        async def match_handler(ctx: p.EngineContext, match: p.GuidelineMatch) -> None:
+            self.captured_guideline_id = match.id
+
+        self.guideline = await self.agent.create_guideline(
+            condition="Customer says hello",
+            action="Greet the customer warmly",
+            on_match=match_handler,
+        )
+
+    async def run(self, ctx: Context) -> None:
+        await ctx.send_and_receive_message(
+            customer_message="Hello there!",
+            recipient=self.agent,
+        )
+
+        assert self.captured_guideline_id == self.guideline.id, (
+            "Should capture correct guideline ID"
+        )
+
+
+class Test_that_multiple_match_handlers_can_be_registered_for_same_guideline(SDKTest):
+    async def setup(self, server: p.Server) -> None:
+        self.agent = await server.create_agent(
+            name="Multiple Handlers Agent",
+            description="Agent for testing multiple handlers",
+        )
+
+        self.handler1_count = 0
+        self.handler2_count = 0
+
+        async def handler1(ctx: p.EngineContext, match: p.GuidelineMatch) -> None:
+            self.handler1_count += 1
+
+        async def handler2(ctx: p.EngineContext, match: p.GuidelineMatch) -> None:
+            self.handler2_count += 1
+
+        self.guideline = await self.agent.create_guideline(
+            condition="Customer asks for help",
+            action="Offer assistance",
+            on_match=handler1,
+        )
+
+        async def shim_handler2(
+            core_ctx: p.EngineContext,
+            core_match: _GuidelineMatch,
+        ) -> None:
+            sdk_match = p.GuidelineMatch(
+                id=core_match.guideline.id,
+                matched=True,
+                rationale=core_match.rationale,
+            )
+            await handler2(core_ctx, sdk_match)
+
+        server.container[EngineHooks].guideline_match_handlers[self.guideline.id].append(
+            shim_handler2
+        )
+
+    async def run(self, ctx: Context) -> None:
+        await ctx.send_and_receive_message(
+            customer_message="I need help please",
+            recipient=self.agent,
+        )
+
+        assert self.handler1_count == 1, "Handler 1 should be called once"
+        assert self.handler2_count == 1, "Handler 2 should be called once"
+
+
+class Test_that_match_handlers_for_different_guidelines_are_independent(SDKTest):
+    async def setup(self, server: p.Server) -> None:
+        self.agent = await server.create_agent(
+            name="Independent Handlers Agent",
+            description="Agent for testing independent handlers",
+        )
+
+        self.guideline1_handler_called = False
+        self.guideline2_handler_called = False
+
+        async def handler1(ctx: p.EngineContext, match: p.GuidelineMatch) -> None:
+            self.guideline1_handler_called = True
+
+        async def handler2(ctx: p.EngineContext, match: p.GuidelineMatch) -> None:
+            self.guideline2_handler_called = True
+
+        self.guideline1 = await self.agent.create_guideline(
+            condition="Customer mentions pizza",
+            action="Recommend pizza toppings",
+            on_match=handler1,
+        )
+
+        self.guideline2 = await self.agent.create_guideline(
+            condition="Customer mentions pasta",
+            action="Recommend pasta dishes",
+            on_match=handler2,
+        )
+
+    async def run(self, ctx: Context) -> None:
+        await ctx.send_and_receive_message(
+            customer_message="I'd like to order some pizza",
+            recipient=self.agent,
+        )
+
+        assert self.guideline1_handler_called, "Guideline 1 handler should be called"
+        assert not self.guideline2_handler_called, "Guideline 2 handler should NOT be called"
+
+
+class Test_that_match_handler_on_journey_guideline_works(SDKTest):
+    async def setup(self, server: p.Server) -> None:
+        self.agent = await server.create_agent(
+            name="Journey Match Handler Agent",
+            description="Agent for testing journey guideline handlers",
+        )
+
+        self.journey = await self.agent.create_journey(
+            title="Order Something",
+            description="Journey to handle orders",
+            conditions=["Customer wants to order something"],
+        )
+
+        self.handler_called = False
+
+        async def match_handler(ctx: p.EngineContext, match: p.GuidelineMatch) -> None:
+            self.handler_called = True
+
+        self.guideline = await self.journey.create_guideline(
+            condition="Customer wants to order a banana",
+            action="Tell them it's an excellent choice",
+            on_match=match_handler,
+        )
+
+    async def run(self, ctx: Context) -> None:
+        await ctx.send_and_receive_message(
+            customer_message="I'd like to order a banana",
+            recipient=self.agent,
+        )
+
+        assert self.handler_called, "Journey guideline handler should have been called"
+
+
+class Test_that_guideline_can_be_created_with_custom_id(SDKTest):
+    async def setup(self, server: p.Server) -> None:
+        from parlant.core.guidelines import GuidelineId
+
+        self.agent = await server.create_agent(
+            name="Custom ID Agent",
+            description="Agent for testing custom ID functionality",
+        )
+
+        self.custom_id = GuidelineId("custom-guideline-789")
+
+        self.guideline = await self.agent.create_guideline(
+            condition="Customer mentions custom ID requirement",
+            action="Provide custom ID assistance",
+            id=self.custom_id,
+        )
+
+    async def run(self, ctx: Context) -> None:
+        # Verify the guideline was created with the custom ID
+        assert self.guideline.id == self.custom_id
+
+        # Verify it can be retrieved from the store
+        guideline_store = ctx.container[GuidelineStore]
+        stored_guideline = await guideline_store.read_guideline(self.custom_id)
+
+        assert stored_guideline.id == self.custom_id
+        assert stored_guideline.content.condition == "Customer mentions custom ID requirement"
+        assert stored_guideline.content.action == "Provide custom ID assistance"
+
+
+class Test_that_guideline_creation_fails_with_duplicate_id(SDKTest):
+    async def setup(self, server: p.Server) -> None:
+        from parlant.core.guidelines import GuidelineId
+
+        self.agent = await server.create_agent(
+            name="Duplicate ID Agent",
+            description="Agent for testing duplicate ID handling",
+        )
+
+        self.duplicate_id = GuidelineId("duplicate-guideline-101")
+
+        # Create the first guideline
+        self.first_guideline = await self.agent.create_guideline(
+            condition="First guideline condition",
+            action="First guideline action",
+            id=self.duplicate_id,
+        )
+
+    async def run(self, ctx: Context) -> None:
+        # Verify the first guideline was created
+        assert self.first_guideline.id == self.duplicate_id
+
+        # Try to create a second guideline with the same ID
+        with pytest.raises(
+            ValueError, match=f"Guideline with id '{self.duplicate_id}' already exists"
+        ):
+            await self.agent.create_guideline(
+                condition="Second guideline condition",
+                action="Second guideline action",
+                id=self.duplicate_id,
+            )
+
+
+class Test_that_only_prioritized_guideline_handler_is_called_when_both_match(SDKTest):
+    async def setup(self, server: p.Server) -> None:
+        self.agent = await server.create_agent(
+            name="Priority Test Agent",
+            description="Agent for testing priority with handlers",
+        )
+
+        self.general_handler_called = False
+        self.specific_handler_called = False
+
+        async def general_handler(ctx: p.EngineContext, match: p.GuidelineMatch) -> None:
+            self.general_handler_called = True
+
+        async def specific_handler(ctx: p.EngineContext, match: p.GuidelineMatch) -> None:
+            self.specific_handler_called = True
+
+        # Create general guideline that would match any help request
+        self.general_guideline = await self.agent.create_guideline(
+            condition="Customer asks for help",
+            action="Provide general help information",
+            on_match=general_handler,
+        )
+
+        # Create more specific guideline that should take priority
+        self.specific_guideline = await self.agent.create_guideline(
+            condition="Customer asks for help with billing",
+            action="Provide billing-specific help",
+            on_match=specific_handler,
+        )
+
+        # Make specific guideline prioritize over general guideline
+        await self.specific_guideline.prioritize_over(self.general_guideline)
+
+    async def run(self, ctx: Context) -> None:
+        # Send a message that would match both guidelines
+        await ctx.send_and_receive_message(
+            customer_message="I need help with billing please",
+            recipient=self.agent,
+        )
+
+        # Only the specific (prioritized) guideline's handler should be called
+        assert self.specific_handler_called, "Specific guideline handler should have been called"
+        assert not self.general_handler_called, (
+            "General guideline handler should NOT have been called "
+            "because it was de-prioritized during resolution"
+        )
+
+
+class Test_that_guideline_can_be_created_with_criticality(SDKTest):
+    async def setup(self, server: p.Server) -> None:
+        from parlant.core.common import Criticality
+
+        self.agent = await server.create_agent(
+            name="Criticality Test Agent",
+            description="Agent for testing guideline criticality",
+        )
+
+        self.guideline = await self.agent.create_guideline(
+            condition="Customer asks about high priority issue",
+            action="Escalate immediately to senior support",
+            criticality=Criticality.HIGH,
+        )
+
+    async def run(self, ctx: Context) -> None:
+        from parlant.core.common import Criticality
+
+        guideline_store = ctx.container[GuidelineStore]
+        stored_guideline = await guideline_store.read_guideline(guideline_id=self.guideline.id)
+
+        assert stored_guideline.criticality == Criticality.HIGH
+
+
+class Test_that_guideline_defaults_to_medium_criticality_when_not_provided(SDKTest):
+    async def setup(self, server: p.Server) -> None:
+        self.agent = await server.create_agent(
+            name="Default Criticality Test Agent",
+            description="Agent for testing default criticality",
+        )
+
+        self.guideline = await self.agent.create_guideline(
+            condition="Customer asks a general question",
+            action="Provide standard information",
+        )
+
+    async def run(self, ctx: Context) -> None:
+        from parlant.core.common import Criticality
+
+        guideline_store = ctx.container[GuidelineStore]
+        stored_guideline = await guideline_store.read_guideline(guideline_id=self.guideline.id)
+
+        assert stored_guideline.criticality == Criticality.MEDIUM
+
+
+class Test_that_observation_can_be_created_with_criticality(SDKTest):
+    async def setup(self, server: p.Server) -> None:
+        from parlant.core.common import Criticality
+
+        self.agent = await server.create_agent(
+            name="Observation Criticality Test Agent",
+            description="Agent for testing observation criticality",
+        )
+
+        self.observation = await self.agent.create_observation(
+            condition="Customer shows signs of extreme frustration",
+            description="High priority observation requiring immediate attention",
+            criticality=Criticality.HIGH,
+        )
+
+    async def run(self, ctx: Context) -> None:
+        from parlant.core.common import Criticality
+
+        guideline_store = ctx.container[GuidelineStore]
+        stored_observation = await guideline_store.read_guideline(guideline_id=self.observation.id)
+
+        assert stored_observation.criticality == Criticality.HIGH
+
+
+class Test_that_observation_defaults_to_medium_criticality_when_not_provided(SDKTest):
+    async def setup(self, server: p.Server) -> None:
+        self.agent = await server.create_agent(
+            name="Default Observation Criticality Test Agent",
+            description="Agent for testing default observation criticality",
+        )
+
+        self.observation = await self.agent.create_observation(
+            condition="Customer asks about store hours",
+        )
+
+    async def run(self, ctx: Context) -> None:
+        from parlant.core.common import Criticality
+
+        guideline_store = ctx.container[GuidelineStore]
+        stored_observation = await guideline_store.read_guideline(guideline_id=self.observation.id)
+
+        assert stored_observation.criticality == Criticality.MEDIUM

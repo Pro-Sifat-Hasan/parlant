@@ -21,16 +21,21 @@ import traceback
 from typing_extensions import override
 
 from parlant.core.common import DefaultBaseModel, JSONSerializable
-from parlant.core.engines.alpha.guideline_matching.generic.common import internal_representation
+from parlant.core.engines.alpha.guideline_matching.common import measure_guideline_matching_batch
+from parlant.core.engines.alpha.guideline_matching.generic.common import (
+    internal_representation,
+)
 from parlant.core.engines.alpha.guideline_matching.guideline_match import (
     GuidelineMatch,
 )
 from parlant.core.engines.alpha.guideline_matching.guideline_matcher import (
     GuidelineMatchingBatch,
     GuidelineMatchingBatchResult,
-    GuidelineMatchingContext,
     GuidelineMatchingBatchError,
     GuidelineMatchingStrategy,
+)
+from parlant.core.engines.alpha.guideline_matching.guideline_matching_context import (
+    GuidelineMatchingContext,
 )
 from parlant.core.engines.alpha.optimization_policy import OptimizationPolicy
 from parlant.core.engines.alpha.prompt_builder import BuiltInSection, PromptBuilder, SectionStatus
@@ -38,6 +43,7 @@ from parlant.core.entity_cq import EntityQueries
 from parlant.core.guidelines import Guideline, GuidelineContent, GuidelineId
 from parlant.core.journeys import Journey
 from parlant.core.loggers import Logger
+from parlant.core.meter import Meter
 from parlant.core.nlp.generation import SchematicGenerator
 from parlant.core.sessions import Event, EventId, EventKind, EventSource
 from parlant.core.shots import Shot, ShotCollection
@@ -70,6 +76,7 @@ class GenericObservationalGuidelineMatchingBatch(GuidelineMatchingBatch):
     def __init__(
         self,
         logger: Logger,
+        meter: Meter,
         optimization_policy: OptimizationPolicy,
         schematic_generator: SchematicGenerator[GenericObservationalGuidelineMatchesSchema],
         guidelines: Sequence[Guideline],
@@ -77,15 +84,21 @@ class GenericObservationalGuidelineMatchingBatch(GuidelineMatchingBatch):
         context: GuidelineMatchingContext,
     ) -> None:
         self._logger = logger
+        self._meter = meter
         self._optimization_policy = optimization_policy
         self._schematic_generator = schematic_generator
         self._guidelines = {str(i): g for i, g in enumerate(guidelines, start=1)}
         self._journeys = journeys
         self._context = context
 
+    @property
+    @override
+    def size(self) -> int:
+        return len(self._guidelines)
+
     @override
     async def process(self) -> GuidelineMatchingBatchResult:
-        with self._logger.operation(f"Batch of {len(self._guidelines)} guidelines"):
+        async with measure_guideline_matching_batch(self._meter, self):
             prompt = self._build_prompt(shots=await self.shots())
 
             generation_attempt_temperatures = (
@@ -275,6 +288,7 @@ Examples of Condition Evaluations:
         builder.add_context_variables(self._context.context_variables)
         builder.add_glossary(self._context.terms)
         builder.add_capabilities_for_guideline_matching(self._context.capabilities)
+        builder.add_customer_identity(self._context.customer, self._context.session)
         builder.add_interaction_history(self._context.interaction_history)
         builder.add_staged_tool_events(self._context.staged_events)
         builder.add_section(
@@ -317,11 +331,13 @@ class ObservationalGuidelineMatching(GuidelineMatchingStrategy):
     def __init__(
         self,
         logger: Logger,
+        meter: Meter,
         optimization_policy: OptimizationPolicy,
         entity_queries: EntityQueries,
         schematic_generator: SchematicGenerator[GenericObservationalGuidelineMatchesSchema],
     ) -> None:
         self._logger = logger
+        self._meter = meter
         self._optimization_policy = optimization_policy
         self._entity_queries = entity_queries
         self._schematic_generator = schematic_generator
@@ -392,6 +408,7 @@ class ObservationalGuidelineMatching(GuidelineMatchingStrategy):
     ) -> GenericObservationalGuidelineMatchingBatch:
         return GenericObservationalGuidelineMatchingBatch(
             logger=self._logger,
+            meter=self._meter,
             optimization_policy=self._optimization_policy,
             schematic_generator=self._schematic_generator,
             guidelines=guidelines,
@@ -414,8 +431,9 @@ def _make_event(e_id: str, source: EventSource, message: str) -> Event:
         kind=EventKind.MESSAGE,
         creation_utc=datetime.now(timezone.utc),
         offset=0,
-        correlation_id="",
+        trace_id="",
         data={"message": message},
+        metadata={},
         deleted=False,
     )
 

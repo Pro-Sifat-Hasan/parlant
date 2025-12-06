@@ -15,6 +15,7 @@
 from collections import defaultdict
 from fastapi import APIRouter, Path, Query, Request, status
 from fastapi.responses import PlainTextResponse
+from html import escape
 from pydantic import Field
 from typing import Annotated, Sequence, TypeAlias, cast
 
@@ -36,6 +37,7 @@ from parlant.core.journeys import (
 )
 from parlant.core.guidelines import GuidelineId
 from parlant.core.tags import TagId
+import re
 
 API_GROUP = "journeys"
 
@@ -82,7 +84,6 @@ JourneyConditionField: TypeAlias = Annotated[
 JourneyTagsField: TypeAlias = Annotated[
     list[TagId],
     Field(
-        default=None,
         description="List of tag IDs associated with the journey",
         examples=[["tag1", "tag2"]],
     ),
@@ -133,7 +134,7 @@ class JourneyDTO(
     title: JourneyTitleField
     description: str
     conditions: Sequence[GuidelineId]
-    tags: JourneyTagsField
+    tags: JourneyTagsField = []
 
 
 class JourneyCreationParamsDTO(
@@ -147,13 +148,13 @@ class JourneyCreationParamsDTO(
     title: JourneyTitleField
     description: str
     conditions: Sequence[JourneyConditionField]
+    id: JourneyIdPath | None = None
     tags: JourneyTagsField | None = None
 
 
 JourneyConditionUpdateAddField: TypeAlias = Annotated[
     list[GuidelineId],
     Field(
-        default=None,
         description="List of guideline IDs to add to the journey",
         examples=[["guid_123xz", "guid_456abc"]],
     ),
@@ -162,7 +163,6 @@ JourneyConditionUpdateAddField: TypeAlias = Annotated[
 JourneyConditionUpdateRemoveField: TypeAlias = Annotated[
     list[GuidelineId],
     Field(
-        default=None,
         description="List of guideline IDs to remove from the journey",
         examples=[["guid_123xz", "guid_456abc"]],
     ),
@@ -195,7 +195,6 @@ class JourneyConditionUpdateParamsDTO(
 JourneyTagUpdateAddField: TypeAlias = Annotated[
     list[TagId],
     Field(
-        default=None,
         description="List of tag IDs to add to the journey",
         examples=[["tag1", "tag2"]],
     ),
@@ -204,7 +203,6 @@ JourneyTagUpdateAddField: TypeAlias = Annotated[
 JourneyTagUpdateRemoveField: TypeAlias = Annotated[
     list[TagId],
     Field(
-        default=None,
         description="List of tag IDs to remove from the journey",
         examples=[["tag1", "tag2"]],
     ),
@@ -307,6 +305,20 @@ async def _build_mermaid_chart(
     transitions: list[str] = []
     style_lines: list[str] = []
 
+    def escape_mermaid(s: str) -> str:
+        def convert_match(match: re.Match[str]) -> str:
+            number = match.group(1)
+            if number.startswith("x"):
+                dec_num = int(number[1:], 16)  # convert hex to decimal
+                return f"#{dec_num};"
+            else:
+                return f"#{number};"  # keep decimal as is
+
+        html_escaped = escape(s, quote=True)
+
+        # apply regex replacement to fix numeric character references for mermaid syntax
+        return re.sub(r"&#(x[0-9a-fA-F]+|[0-9]+);", convert_match, html_escaped)
+
     def declare(nid: JourneyNodeId) -> None:
         if nid == JourneyStore.END_NODE_ID or nid in declared:
             return
@@ -315,7 +327,7 @@ async def _build_mermaid_chart(
             return
         declared.add(nid)
         m = mermaid_id(nid)
-        state_decls.append(f"    {m}: {lbl}")
+        state_decls.append(f'    state "{escape_mermaid(lbl)}" as {m}')
         node = node_by_id.get(nid)
         if node and _is_tool_node(node):
             style_lines.append(f"style {m} {TOOL_STYLE}")
@@ -390,7 +402,7 @@ def create_router(
                 "description": "Journey successfully created. Returns the complete journey object including generated ID.",
                 "content": example_json_content(journey_example),
             },
-            status.HTTP_422_UNPROCESSABLE_ENTITY: {
+            status.HTTP_422_UNPROCESSABLE_CONTENT: {
                 "description": "Validation error in request parameters"
             },
         },
@@ -404,12 +416,16 @@ def create_router(
         Creates a new journey in the system.
 
         The journey will be initialized with the provided title, description, and conditions.
-        A unique identifier will be automatically generated.
+        A unique identifier will be automatically generated unless a custom ID is provided.
         """
         await authorization_policy.authorize(request=request, operation=Operation.CREATE_JOURNEY)
 
         journey, guidelines = await app.journeys.create(
-            params.title, params.description, params.conditions, params.tags
+            title=params.title,
+            description=params.description,
+            conditions=params.conditions,
+            tags=params.tags,
+            id=params.id,
         )
 
         return JourneyDTO(
@@ -531,7 +547,7 @@ def create_router(
             status.HTTP_404_NOT_FOUND: {
                 "description": "Journey not found. the specified `journey_id` does not exist"
             },
-            status.HTTP_422_UNPROCESSABLE_ENTITY: {
+            status.HTTP_422_UNPROCESSABLE_CONTENT: {
                 "description": "Validation error in update parameters"
             },
         },

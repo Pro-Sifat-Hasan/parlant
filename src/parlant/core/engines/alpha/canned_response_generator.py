@@ -28,9 +28,10 @@ import traceback
 from typing import Any, Iterable, Mapping, Optional, Sequence, cast
 from typing_extensions import override
 
-from parlant.core.async_utils import safe_gather
+from parlant.core.async_utils import safe_gather, CancellationSuppressionLatch
 from parlant.core.capabilities import Capability
-from parlant.core.contextual_correlator import ContextualCorrelator
+from parlant.core.meter import DurationHistogram, Meter
+from parlant.core.tracer import Tracer
 from parlant.core.agents import Agent, CompositionMode
 from parlant.core.context_variables import ContextVariable, ContextVariableValue
 from parlant.core.customers import Customer
@@ -39,7 +40,7 @@ from parlant.core.engines.alpha.guideline_matching.generic.common import (
     internal_representation,
 )
 from parlant.core.engines.alpha.hooks import EngineHooks
-from parlant.core.engines.alpha.loaded_context import LoadedContext
+from parlant.core.engines.alpha.engine_context import EngineContext
 from parlant.core.engines.alpha.message_event_composer import (
     MessageCompositionError,
     MessageEventComposer,
@@ -47,7 +48,9 @@ from parlant.core.engines.alpha.message_event_composer import (
 )
 from parlant.core.engines.alpha.message_generator import MessageGenerator
 from parlant.core.engines.alpha.optimization_policy import OptimizationPolicy
-from parlant.core.engines.alpha.perceived_performance_policy import PerceivedPerformancePolicy
+from parlant.core.engines.alpha.perceived_performance_policy import (
+    PerceivedPerformancePolicyProvider,
+)
 from parlant.core.engines.alpha.tool_calling.tool_caller import ToolInsights
 from parlant.core.entity_cq import EntityQueries
 from parlant.core.guidelines import GuidelineId
@@ -66,11 +69,12 @@ from parlant.core.sessions import (
     EventSource,
     MessageEventData,
     Participant,
+    Session,
     ToolCall,
     ToolEventData,
 )
-from parlant.core.common import CancellationSuppressionLatch, DefaultBaseModel, JSONSerializable
-from parlant.core.loggers import LogLevel, Logger
+from parlant.core.common import DefaultBaseModel, JSONSerializable
+from parlant.core.loggers import Logger
 from parlant.core.shots import Shot, ShotCollection
 from parlant.core.tools import ToolId
 
@@ -78,11 +82,11 @@ DEFAULT_NO_MATCH_CANREP = "Not sure I understand. Could you please say that anot
 
 
 class NoMatchResponseProvider(ABC):
-    async def get_response(self, context: LoadedContext, draft: str | None) -> CannedResponse:
+    async def get_response(self, context: EngineContext, draft: str | None) -> CannedResponse:
         return CannedResponse.create_transient(await self.get_template(context, draft))
 
     @abstractmethod
-    async def get_template(self, context: LoadedContext, draft: str | None) -> str: ...
+    async def get_template(self, context: EngineContext, draft: str | None) -> str: ...
 
 
 class BasicNoMatchResponseProvider(NoMatchResponseProvider):
@@ -90,7 +94,7 @@ class BasicNoMatchResponseProvider(NoMatchResponseProvider):
         self.template = DEFAULT_NO_MATCH_CANREP
 
     @override
-    async def get_template(self, context: LoadedContext, draft: str | None) -> str:
+    async def get_template(self, context: EngineContext, draft: str | None) -> str:
         return self.template
 
 
@@ -151,7 +155,7 @@ class _CannedResponseRenderResult:
 class _CannedResponseSelectionResult:
     message: str
     draft: str | None
-    rendered_canned_responses: Sequence[tuple[CannedResponseId, str]]
+    rendered_canned_responses: Sequence[tuple[CannedResponse, str]]
     chosen_canned_responses: list[tuple[CannedResponseId, str]]
 
 
@@ -160,6 +164,7 @@ class CannedResponseContext:
     event_emitter: EventEmitter
     agent: Agent
     customer: Customer
+    session: Session
     context_variables: Sequence[tuple[ContextVariable, ContextVariableValue]]
     interaction_history: Sequence[Event]
     terms: Sequence[Term]
@@ -337,7 +342,7 @@ class GenerativeFieldExtraction(CannedResponseFieldExtractionMethod):
         )
 
         builder.add_agent_identity(context.agent)
-        builder.add_customer_identity(context.customer)
+        builder.add_customer_identity(context.customer, context.session)
         builder.add_context_variables(context.context_variables)
 
         all_guideline_matches = list(
@@ -466,7 +471,8 @@ class CannedResponseGenerator(MessageEventComposer):
     def __init__(
         self,
         logger: Logger,
-        correlator: ContextualCorrelator,
+        tracer: Tracer,
+        meter: Meter,
         hooks: EngineHooks,
         optimization_policy: OptimizationPolicy,
         canned_response_draft_generator: SchematicGenerator[CannedResponseDraftSchema],
@@ -476,7 +482,7 @@ class CannedResponseGenerator(MessageEventComposer):
         follow_up_canned_response_generator: SchematicGenerator[
             FollowUpCannedResponseSelectionSchema
         ],
-        perceived_performance_policy: PerceivedPerformancePolicy,
+        perceived_performance_policy_provider: PerceivedPerformancePolicyProvider,
         canned_response_store: CannedResponseStore,
         field_extractor: CannedResponseFieldExtractor,
         message_generator: MessageGenerator,
@@ -484,7 +490,9 @@ class CannedResponseGenerator(MessageEventComposer):
         no_match_provider: NoMatchResponseProvider,
     ) -> None:
         self._logger = logger
-        self._correlator = correlator
+        self._tracer = tracer
+        self._meter = meter
+
         self._hooks = hooks
         self._optimization_policy = optimization_policy
         self._canrep_draft_generator = canned_response_draft_generator
@@ -493,13 +501,57 @@ class CannedResponseGenerator(MessageEventComposer):
         self._canrep_preamble_generator = canned_response_preamble_generator
         self._follow_up_canrep_generator = follow_up_canned_response_generator
         self._canned_response_store = canned_response_store
-        self._perceived_performance_policy = perceived_performance_policy
+        self._perceived_performance_policy_provider = perceived_performance_policy_provider
         self._field_extractor = field_extractor
         self._message_generator = message_generator
         self._cached_response_fields: dict[CannedResponseId, set[str]] = {}
         self._entity_queries = entity_queries
         self._no_match_provider = no_match_provider
         self._follow_ups_enabled = True
+        self.candidate_similarity_threshold = 0.5
+
+        self._define_histograms()
+
+    def _define_histograms(self) -> None:
+        def _create_histogram(name: str, description: str) -> DurationHistogram:
+            return self._meter.create_duration_histogram(
+                name=f"canrep.{name}",
+                description=description,
+            )
+
+        self._hist_canned_response_duration = self._meter.create_duration_histogram(
+            name="canrep",
+            description="Duration of canned response generation in milliseconds",
+        )
+
+        self._hist_preamble_duration = _create_histogram(
+            name="preamble",
+            description="Duration of canned response preamble generation in milliseconds",
+        )
+        self._hist_preamble_render_duration = _create_histogram(
+            name="preamble.render",
+            description="Duration of canned response rendering in milliseconds",
+        )
+        self._hist_render_duration = _create_histogram(
+            name="render",
+            description="Duration of canned response rendering in milliseconds",
+        )
+        self._hist_draft_duration = _create_histogram(
+            name="draft",
+            description="Duration of canned response draft generation in milliseconds",
+        )
+        self._hist_retrieval_duration = _create_histogram(
+            name="retrieval",
+            description="Duration of canned response retrieval in milliseconds",
+        )
+        self._hist_recompose_duration = _create_histogram(
+            name="recompose",
+            description="Duration of canned response recomposition in milliseconds",
+        )
+        self._hist_selection_duration = _create_histogram(
+            name="selection",
+            description="Duration of canned response selection in milliseconds",
+        )
 
     async def draft_generation_shots(
         self, composition_mode: CompositionMode
@@ -511,16 +563,16 @@ class CannedResponseGenerator(MessageEventComposer):
     @override
     async def generate_preamble(
         self,
-        context: LoadedContext,
+        context: EngineContext,
     ) -> Sequence[MessageEventComposition]:
         with self._logger.scope("MessageEventComposer"):
             with self._logger.scope("CannedResponseGenerator"):
-                with self._logger.operation("Preamble generation", create_scope=False):
+                async with self._hist_preamble_duration.measure():
                     return await self._do_generate_preamble(context)
 
     async def _do_generate_preamble(
         self,
-        context: LoadedContext,
+        context: EngineContext,
     ) -> Sequence[MessageEventComposition]:
         agent = context.agent
 
@@ -528,6 +580,7 @@ class CannedResponseGenerator(MessageEventComposer):
             event_emitter=context.session_event_emitter,
             agent=agent,
             customer=context.customer,
+            session=context.session,
             context_variables=context.state.context_variables,
             interaction_history=context.interaction.history,
             terms=list(context.state.glossary_terms),
@@ -586,9 +639,7 @@ You must generate the preamble message. You must produce a JSON object with a si
                 if Tag.preamble() in canrep.tags
             ]
 
-            with self._logger.operation(
-                "Rendering canned preamble templates", create_scope=False, level=LogLevel.TRACE
-            ):
+            async with self._hist_preamble_render_duration.measure():
                 preamble_choices = [
                     str(r.rendered_text)
                     for r in await self._render_responses(canrep_context, preamble_responses)
@@ -646,7 +697,7 @@ You will now be given the current state of the interaction to which you must gen
         )
 
         await canrep_context.event_emitter.emit_status_event(
-            correlation_id=f"{self._correlator.correlation_id}",
+            trace_id=f"{self._tracer.trace_id}",
             data={
                 "status": "typing",
                 "data": {},
@@ -672,7 +723,7 @@ You will now be given the current state of the interaction to which you must gen
             # If we're in, the hook did not bail out.
 
             emitted_event = await canrep_context.event_emitter.emit_message_event(
-                correlation_id=f"{self._correlator.correlation_id}",
+                trace_id=self._tracer.trace_id,
                 data=MessageEventData(
                     message=canrep.content.preamble,
                     participant=Participant(id=agent.id, display_name=agent.name),
@@ -692,12 +743,12 @@ You will now be given the current state of the interaction to which you must gen
     @override
     async def generate_response(
         self,
-        context: LoadedContext,
-        latch: Optional[CancellationSuppressionLatch] = None,
+        context: EngineContext,
+        latch: Optional[CancellationSuppressionLatch[None]] = None,
     ) -> Sequence[MessageEventComposition]:
         with self._logger.scope("MessageEventComposer"):
             with self._logger.scope("CannedResponseGenerator"):
-                with self._logger.operation("Response generation", create_scope=False):
+                async with self._hist_canned_response_duration.measure():
                     return await self._do_generate_events(
                         loaded_context=context,
                         latch=latch,
@@ -780,15 +831,35 @@ You will now be given the current state of the interaction to which you must gen
 
     async def _do_generate_events(
         self,
-        loaded_context: LoadedContext,
-        latch: Optional[CancellationSuppressionLatch] = None,
+        loaded_context: EngineContext,
+        latch: Optional[CancellationSuppressionLatch[None]] = None,
     ) -> Sequence[MessageEventComposition]:
+        is_first_message_emitted = False
+
         async def output_messages(
             generation_result: _CannedResponseSelectionResult,
         ) -> list[EmittedEvent]:
+            nonlocal is_first_message_emitted
             emitted_events: list[EmittedEvent] = []
             if generation_result is not None:
-                sub_messages = generation_result.message.strip().split("\n\n")
+                policy = self._perceived_performance_policy_provider.get_policy(context.agent.id)
+
+                chosen_canrep = next(
+                    iter(
+                        canrep
+                        for canrep, _ in generation_result.rendered_canned_responses
+                        if generation_result.chosen_canned_responses[0][0] == canrep.id
+                    ),
+                    None,
+                )
+                metadata = chosen_canrep.metadata if chosen_canrep else {}
+
+                if await policy.is_message_splitting_required(
+                    loaded_context, generation_result.message
+                ):
+                    sub_messages = generation_result.message.strip().split("\n\n")
+                else:
+                    sub_messages = [generation_result.message.strip()]
 
                 while sub_messages:
                     m = sub_messages.pop(0)
@@ -797,7 +868,7 @@ You will now be given the current state of the interaction to which you must gen
                         # If we're in, the hook did not bail out.
 
                         event = await event_emitter.emit_message_event(
-                            correlation_id=self._correlator.correlation_id,
+                            trace_id=self._tracer.trace_id,
                             data=MessageEventData(
                                 message=m,
                                 participant=Participant(id=agent.id, display_name=agent.name),
@@ -809,22 +880,41 @@ You will now be given the current state of the interaction to which you must gen
                                 message=m,
                                 participant=Participant(id=agent.id, display_name=agent.name),
                             ),
+                            metadata=metadata,
                         )
+                        if not is_first_message_emitted:
+                            self._tracer.add_event("canrep.ttfm")
+                            is_first_message_emitted = True
 
                         emitted_events.append(event)
 
                         await context.event_emitter.emit_status_event(
-                            correlation_id=self._correlator.correlation_id,
+                            trace_id=self._tracer.trace_id,
+                            data={
+                                "status": "ready",
+                                "data": {},
+                            },
+                        )
+                    else:
+                        await context.event_emitter.emit_status_event(
+                            trace_id=self._tracer.trace_id,
                             data={
                                 "status": "ready",
                                 "data": {},
                             },
                         )
 
+                        return []
+
                     if next_message := sub_messages[0] if sub_messages else None:
-                        await self._perceived_performance_policy.get_follow_up_delay()
+                        policy = self._perceived_performance_policy_provider.get_policy(
+                            context.agent.id
+                        )
+
+                        await policy.get_follow_up_delay()
+
                         await context.event_emitter.emit_status_event(
-                            correlation_id=self._correlator.correlation_id,
+                            trace_id=self._tracer.trace_id,
                             data={
                                 "status": "typing",
                                 "data": {},
@@ -861,6 +951,7 @@ You will now be given the current state of the interaction to which you must gen
         event_emitter = loaded_context.session_event_emitter
         agent = loaded_context.agent
         customer = loaded_context.customer
+        session = loaded_context.session
         context_variables = loaded_context.state.context_variables
         interaction_history = loaded_context.interaction.history
         terms = list(loaded_context.state.glossary_terms)
@@ -886,6 +977,7 @@ You will now be given the current state of the interaction to which you must gen
             event_emitter=event_emitter,
             agent=agent,
             customer=customer,
+            session=session,
             context_variables=context_variables,
             interaction_history=interaction_history,
             terms=terms,
@@ -898,7 +990,7 @@ You will now be given the current state of the interaction to which you must gen
             staged_message_events=staged_message_events,
         )
 
-        responses = await self._get_relevant_canned_responses(context)
+        canreps = await self._get_relevant_canned_responses(context)
 
         follow_up_selection_attempt_temperatures = (
             self._optimization_policy.get_message_generation_retry_temperatures(
@@ -916,7 +1008,7 @@ You will now be given the current state of the interaction to which you must gen
                 generation_info, generation_result = await self._generate_response(
                     loaded_context,
                     context,
-                    responses,
+                    canreps,
                     agent.composition_mode,
                     temperature=follow_up_selection_attempt_temperatures[generation_attempt],
                 )
@@ -960,7 +1052,7 @@ You will now be given the current state of the interaction to which you must gen
 
                     if follow_up_canrep_response:
                         await context.event_emitter.emit_status_event(
-                            correlation_id=self._correlator.correlation_id,
+                            trace_id=self._tracer.trace_id,
                             data={
                                 "status": "typing",
                                 "data": {},
@@ -1100,6 +1192,7 @@ Example {i} - {shot.description}: ###
         self,
         agent: Agent,
         customer: Customer,
+        session: Session,
         context_variables: Sequence[tuple[ContextVariable, ContextVariableValue]],
         interaction_history: Sequence[Event],
         terms: Sequence[Term],
@@ -1136,7 +1229,7 @@ Later in this prompt, you'll be provided with behavioral guidelines and other co
         )
 
         builder.add_agent_identity(agent)
-        builder.add_customer_identity(customer)
+        builder.add_customer_identity(customer, session)
         builder.add_section(
             name="canned-response-generator-draft-task-description",
             template="""
@@ -1398,7 +1491,7 @@ Produce a valid JSON object according to the following spec. Use the values prov
         self,
         context: CannedResponseContext,
         draft_message: str,
-        canned_responses: Sequence[tuple[CannedResponseId, str]],
+        canned_responses: Sequence[tuple[CannedResponse, str]],
     ) -> PromptBuilder:
         builder = PromptBuilder(
             on_build=lambda prompt: self._logger.trace(
@@ -1407,7 +1500,7 @@ Produce a valid JSON object according to the following spec. Use the values prov
         )
 
         formatted_canreps = "\n".join(
-            [f'Template ID: {canrep[0]} """\n{canrep[1]}\n"""' for canrep in canned_responses]
+            [f'Template ID: {canrep[0].id} """\n{canrep[1]}\n"""' for canrep in canned_responses]
         )
 
         builder.add_section(
@@ -1425,7 +1518,7 @@ Produce a valid JSON object according to the following spec. Use the values prov
         )
 
         builder.add_agent_identity(context.agent)
-        builder.add_customer_identity(context.customer)
+        builder.add_customer_identity(context.customer, context.session)
         builder.add_glossary(context.terms)
         builder.add_interaction_history_for_message_generation(
             context.interaction_history,
@@ -1443,7 +1536,7 @@ Pre-approved reply templates: ###
                 "formatted_canned_responses": formatted_canreps,
             },
         )
-        builder.add_guideliens_for_canrep_selection(
+        builder.add_guidelines_for_canrep_selection(
             list(chain(context.ordinary_guideline_matches, context.tool_enabled_guideline_matches))
         )
         builder.add_section(
@@ -1469,7 +1562,7 @@ Output a JSON object with three properties:
 
     async def _generate_response(
         self,
-        loaded_context: LoadedContext,
+        loaded_context: EngineContext,
         context: CannedResponseContext,
         canned_responses: Sequence[CannedResponse],
         composition_mode: CompositionMode,
@@ -1485,6 +1578,7 @@ Output a JSON object with three properties:
             agent=context.agent,
             context_variables=context.context_variables,
             customer=context.customer,
+            session=context.session,
             interaction_history=context.interaction_history,
             terms=context.terms,
             ordinary_guideline_matches=context.ordinary_guideline_matches,
@@ -1499,7 +1593,7 @@ Output a JSON object with three properties:
 
         if direct_draft_output_mode:
             await context.event_emitter.emit_status_event(
-                correlation_id=self._correlator.correlation_id,
+                trace_id=self._tracer.trace_id,
                 data={
                     "status": "typing",
                     "data": {},
@@ -1518,17 +1612,18 @@ Output a JSON object with three properties:
             )
         else:
             await context.event_emitter.emit_status_event(
-                correlation_id=self._correlator.correlation_id,
+                trace_id=self._tracer.trace_id,
                 data={
                     "status": "processing",
                     "data": {"stage": "Articulating"},
                 },
             )
 
-        draft_response = await self._canrep_draft_generator.generate(
-            prompt=draft_prompt,
-            hints={"temperature": temperature},
-        )
+        async with self._hist_draft_duration.measure():
+            draft_response = await self._canrep_draft_generator.generate(
+                prompt=draft_prompt,
+                hints={"temperature": temperature},
+            )
 
         self._logger.trace(
             f"Canned Response Draft Completion:\n{draft_response.content.model_dump_json(indent=2)}"
@@ -1563,7 +1658,7 @@ Output a JSON object with three properties:
             )
 
         await context.event_emitter.emit_status_event(
-            correlation_id=self._correlator.correlation_id,
+            trace_id=self._tracer.trace_id,
             data={
                 "status": "typing",
                 "data": {},
@@ -1571,18 +1666,17 @@ Output a JSON object with three properties:
         )
 
         # Step 2: Select the most relevant canned response templates based on the draft message
-        with self._logger.operation(
-            "Retrieving top relevant canned response templates",
-            create_scope=False,
-            level=LogLevel.TRACE,
-        ):
+        async with self._hist_retrieval_duration.measure():
+            relevance_scores = await self._canned_response_store.filter_relevant_canned_responses(
+                query=draft_message,
+                available_canned_responses=canned_responses,
+                max_count=30,
+            )
+
             relevant_canreps = set(
                 r.canned_response
-                for r in await self._canned_response_store.find_relevant_canned_responses(
-                    query=draft_message,
-                    available_canned_responses=canned_responses,
-                    max_count=30,
-                )
+                for r in relevance_scores
+                if r.score >= self.candidate_similarity_threshold
             )
 
             # Filtering based on similarity will have taken out all transient
@@ -1597,12 +1691,24 @@ Output a JSON object with three properties:
                 )
             )
 
+            if not relevant_canreps and composition_mode != CompositionMode.CANNED_STRICT:
+                self._logger.debug(
+                    "Skipping canned response selection; no relevant canned responses found"
+                )
+
+                return {
+                    "draft": draft_response.info,
+                }, _CannedResponseSelectionResult(
+                    message=draft_message,
+                    draft=None,
+                    rendered_canned_responses=[],
+                    chosen_canned_responses=[],
+                )
+
         # Step 3: Pre-render these templates so that matching works better
-        with self._logger.operation(
-            "Rendering canned response templates", create_scope=False, level=LogLevel.TRACE
-        ):
+        async with self._hist_render_duration.measure():
             rendered_canreps = [
-                (r.response.id, str(r.rendered_text))
+                (r.response, str(r.rendered_text))
                 for r in await self._render_responses(
                     context=context,
                     responses=relevant_canreps,
@@ -1612,9 +1718,7 @@ Output a JSON object with three properties:
 
         # Step 4.1: In composited mode, recompose the draft message with the style of the rendered canned responses
         if composition_mode == CompositionMode.CANNED_COMPOSITED:
-            with self._logger.operation(
-                "Recomposing draft using canned responses", create_scope=False, level=LogLevel.TRACE
-            ):
+            async with self._hist_recompose_duration.measure():
                 recomposition_generation_info, composited_message = await self._recompose(
                     context=context,
                     draft_message=draft_message,
@@ -1632,9 +1736,7 @@ Output a JSON object with three properties:
                 )
 
         # Step 4.2: In non-composited mode, try to match the draft message with one of the rendered canned responses
-        with self._logger.operation(
-            "Selecting canned response", create_scope=False, level=LogLevel.TRACE
-        ):
+        async with self._hist_selection_duration.measure():
             selection_response = await self._canrep_selection_generator.generate(
                 prompt=self._build_selection_prompt(
                     context=context,
@@ -1705,7 +1807,7 @@ Output a JSON object with three properties:
         # Step 5.3: Assuming a high-quality match or a partial match in strict mode
         selected_canrep_id = CannedResponseId(selection_response.content.chosen_template_id)
         rendered_canned_response = next(
-            (value for crid, value in rendered_canreps if crid == selected_canrep_id),
+            (value for canrep, value in rendered_canreps if canrep.id == selected_canrep_id),
             None,
         )
 
@@ -1990,7 +2092,7 @@ EXAMPLES
         )
 
         builder.add_agent_identity(context.agent)
-        builder.add_customer_identity(context.customer)
+        builder.add_customer_identity(context.customer, context.session)
         builder.add_interaction_history(
             context.interaction_history,
             staged_events=context.staged_message_events,
@@ -2018,7 +2120,7 @@ Pre-approved reply templates: ###
             },
         )
 
-        builder.add_guideliens_for_canrep_selection(
+        builder.add_guidelines_for_canrep_selection(
             list(chain(context.ordinary_guideline_matches, context.tool_enabled_guideline_matches))
         )
 
@@ -2059,18 +2161,18 @@ Output a JSON object with three properties:
 
         try:
             outputted_canreps_ids = [
-                crid for (crid, canrep) in last_response_generation.chosen_canned_responses
+                cid for cid, value in last_response_generation.chosen_canned_responses
             ]
 
-            filtered_rendered_canreps: Sequence[tuple[CannedResponseId, str]] = [
-                (cid, canrep)
-                for cid, canrep in last_response_generation.rendered_canned_responses
-                if cid not in outputted_canreps_ids
+            filtered_rendered_canreps: Sequence[tuple[CannedResponse, str]] = [
+                (canrep, value)
+                for canrep, value in last_response_generation.rendered_canned_responses
+                if canrep.id not in outputted_canreps_ids
             ]  # removes outputted response/s
 
             chronological_id_rendered_canreps = {
-                str(i): (cid, canrep)
-                for i, (cid, canrep) in enumerate(filtered_rendered_canreps, start=1)
+                str(i): (canrep, value)
+                for i, (canrep, value) in enumerate(filtered_rendered_canreps, start=1)
             }
 
             prompt = self._build_follow_up_canned_response_prompt(
@@ -2109,7 +2211,7 @@ Output a JSON object with three properties:
                         message=chosen_canrep[1],
                         draft=response.content.remaining_message_draft,
                         rendered_canned_responses=filtered_rendered_canreps,
-                        chosen_canned_responses=[chosen_canrep],
+                        chosen_canned_responses=[(chosen_canrep[0].id, chosen_canrep[1])],
                     )
                     if chosen_canrep
                     else None

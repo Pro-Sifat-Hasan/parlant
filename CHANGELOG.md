@@ -4,10 +4,13 @@ All notable changes to Parlant will be documented here.
 
 ## [Unreleased]
 
+- Allow specifying custom IDs when creating agents via SDK and API
+- Allow specifying custom IDs when creating customers via SDK and API
 - Allow bailing out of canned response selection and utilize the draft directly, using a hook
 - Add Snowflake Cortex service
 - Add GLM service
 - Add Mistral service
+- Add OpenRouter service
 - Add /healthz endpoint
 - Add .current propoerty for Server, Agent, and Customer in SDK
 - Support proxy URL for LiteLLM
@@ -15,6 +18,32 @@ All notable changes to Parlant will be documented here.
 - Follow-up canned responses
 - Improved Gemini Flash 2.5 output consistency by using function call trick instead of structured outputs
 - Added persistence option for context variable values (variable store)
+- Add Fireworks service
+- Rename ContextualCorrelator to Tracer
+- Add OpenTelemetry integration for Meter, Logger and Tracer
+- Add API for CRUD operations on session metadata
+- Add deferred retrievers
+- Allow controlling perceived performance policy per agent
+- Expose IoC container in server object
+- Support code-based, custom guideline matchers
+- Added guideline descriptions
+- Add guideline on_match() hooks
+- Allow specifying custom IDs when creating journeys via SDK and API
+- Allow specifying custom IDs when creating guidelines via SDK and API
+- Allow specifying custom IDs when creating glossary via SDK and API
+- Add Qdrant VectorDatabase adapter
+- Fix critical bug with cancellation during response analysis
+- Fix critical similarity calculation error in TransientVectorDatabase
+- Add guideline criticality level
+
+## [3.0.3] - 2025-10-23
+
+### Fixed
+
+- Fix installation issue in some environments, failing due to an older FastMCP version
+- Bump versions of OpenTelemetry
+- Made ChromaDB an extra package parlant[chroma]
+- Update NPM dependencies for integrated UI
 
 ## [3.0.2] - 2025-08-27
 
@@ -265,7 +294,7 @@ All notable changes to Parlant will be documented here.
 
 ### Changed
 
-- Return event ID instead of correlation ID from utterance API
+- Return event ID instead of trace ID from utterance API
 - Improve and normalize entity update messages in client CLI
 
 ## [1.3.0] - 2024-12-26

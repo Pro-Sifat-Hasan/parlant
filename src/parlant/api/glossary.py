@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from fastapi import APIRouter, Path, Query, Request, status
+from fastapi import APIRouter, HTTPException, Path, Query, Request, status
 from typing import Annotated, Sequence, TypeAlias
 from pydantic import Field
 
@@ -52,7 +52,6 @@ TermDescriptionField: TypeAlias = Annotated[
 TermSynonymsField: TypeAlias = Annotated[
     Sequence[str],
     Field(
-        default=[],
         description="A list of synonyms for the term, including alternate contexts if applicable.",
         examples=[["Execution Cost", "Blockchain Fuel"]],
     ),
@@ -102,8 +101,9 @@ class TermCreationParamsDTO(
 
     name: TermNameField
     description: TermDescriptionField
-    synonyms: TermSynonymsField
+    synonyms: TermSynonymsField = []
     tags: TermTagsField | None = None
+    id: TermId | None = None
 
 
 term_example: ExampleJson = {
@@ -149,7 +149,7 @@ class TermDTO(
     id: TermIdPath
     name: TermNameField
     description: TermDescriptionField
-    synonyms: TermSynonymsField
+    synonyms: TermSynonymsField = []
     tags: TermTagsField
 
 
@@ -223,7 +223,7 @@ def create_router(
                 "description": "Term successfully created. Returns the complete term object including generated ID",
                 "content": common.example_json_content(term_example),
             },
-            status.HTTP_422_UNPROCESSABLE_ENTITY: {
+            status.HTTP_422_UNPROCESSABLE_CONTENT: {
                 "description": "Validation error in request parameters"
             },
         },
@@ -244,12 +244,19 @@ def create_router(
         """
         await authorization_policy.authorize(request, Operation.CREATE_TERM)
 
-        term = await app.glossary.create(
-            name=params.name,
-            description=params.description,
-            synonyms=params.synonyms,
-            tags=params.tags,
-        )
+        try:
+            term = await app.glossary.create(
+                name=params.name,
+                description=params.description,
+                synonyms=params.synonyms,
+                tags=params.tags,
+                id=params.id,
+            )
+        except ValueError as e:
+            raise HTTPException(
+                status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+                detail=str(e),
+            )
 
         return TermDTO(
             id=term.id,
@@ -342,7 +349,7 @@ def create_router(
             status.HTTP_404_NOT_FOUND: {
                 "description": "Term not found. The specified `term_id` does not exist"
             },
-            status.HTTP_422_UNPROCESSABLE_ENTITY: {
+            status.HTTP_422_UNPROCESSABLE_CONTENT: {
                 "description": "Validation error in update parameters"
             },
         },

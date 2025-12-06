@@ -29,23 +29,25 @@ from typing_extensions import override
 from parlant.core import async_utils
 from parlant.core.agents import Agent, AgentId, CompositionMode
 from parlant.core.capabilities import Capability
-from parlant.core.common import CancellationSuppressionLatch, JSONSerializable
+from parlant.core.common import Criticality, JSONSerializable
 from parlant.core.context_variables import (
     ContextVariable,
     ContextVariableValue,
     ContextVariableStore,
 )
 from parlant.core.emission.event_buffer import EventBuffer
-from parlant.core.engines.alpha.loaded_context import (
+from parlant.core.engines.alpha.engine_context import (
     Interaction,
     IterationState,
-    LoadedContext,
+    EngineContext,
     ResponseState,
 )
 from parlant.core.engines.alpha.entity_context import EntityContext
 from parlant.core.engines.alpha.message_generator import MessageGenerator
 from parlant.core.engines.alpha.hooks import EngineHooks
-from parlant.core.engines.alpha.perceived_performance_policy import PerceivedPerformancePolicy
+from parlant.core.engines.alpha.perceived_performance_policy import (
+    PerceivedPerformancePolicyProvider,
+)
 from parlant.core.engines.alpha.relational_guideline_resolver import RelationalGuidelineResolver
 from parlant.core.engines.alpha.tool_calling.tool_caller import (
     MissingToolData,
@@ -63,6 +65,8 @@ from parlant.core.journey_guideline_projection import (
     extract_node_id_from_journey_node_guideline_id,
 )
 from parlant.core.journeys import Journey, JourneyId
+from parlant.core.meter import Meter
+from parlant.core.app_modules.sessions import SessionUpdateParamsModel
 from parlant.core.sessions import (
     AgentState,
     ContextVariable as StoredContextVariable,
@@ -73,7 +77,6 @@ from parlant.core.sessions import (
     PreparationIteration,
     PreparationIterationGenerations,
     Session,
-    SessionUpdateParams,
     Term as StoredTerm,
     ToolEventData,
 )
@@ -90,8 +93,8 @@ from parlant.core.engines.alpha.tool_event_generator import (
 from parlant.core.engines.alpha.utils import context_variables_to_json
 from parlant.core.engines.types import Context, Engine, UtteranceRationale, UtteranceRequest
 from parlant.core.emissions import EventEmitter, EmittedEvent
-from parlant.core.contextual_correlator import ContextualCorrelator
-from parlant.core.loggers import LogLevel, Logger
+from parlant.core.tracer import Tracer
+from parlant.core.loggers import Logger
 from parlant.core.entity_cq import EntityQueries, EntityCommands
 from parlant.core.tools import ToolContext, ToolId
 
@@ -125,7 +128,8 @@ class AlphaEngine(Engine):
     def __init__(
         self,
         logger: Logger,
-        correlator: ContextualCorrelator,
+        tracer: Tracer,
+        meter: Meter,
         entity_queries: EntityQueries,
         entity_commands: EntityCommands,
         guideline_matcher: GuidelineMatcher,
@@ -133,11 +137,12 @@ class AlphaEngine(Engine):
         tool_event_generator: ToolEventGenerator,
         fluid_message_generator: MessageGenerator,
         canned_response_generator: CannedResponseGenerator,
-        perceived_performance_policy: PerceivedPerformancePolicy,
+        perceived_performance_policy_provider: PerceivedPerformancePolicyProvider,
         hooks: EngineHooks,
     ) -> None:
         self._logger = logger
-        self._correlator = correlator
+        self._tracer = tracer
+        self._meter = meter
 
         self._entity_queries = entity_queries
         self._entity_commands = entity_commands
@@ -147,9 +152,18 @@ class AlphaEngine(Engine):
         self._tool_event_generator = tool_event_generator
         self._fluid_message_generator = fluid_message_generator
         self._canned_response_generator = canned_response_generator
-        self._perceived_performance_policy = perceived_performance_policy
+        self._perceived_performance_policy_provider = perceived_performance_policy_provider
 
         self._hooks = hooks
+
+        self._hist_engine_process_duration = self._meter.create_duration_histogram(
+            name="eng.process",
+            description="Duration of engine processing in milliseconds",
+        )
+        self._hist_engine_utter_duration = self._meter.create_duration_histogram(
+            name="eng.utter",
+            description="Duration of engine utter in milliseconds",
+        )
 
     @override
     async def process(
@@ -166,12 +180,9 @@ class AlphaEngine(Engine):
             return True
 
         try:
-            with self._logger.operation(
-                f"Processing context for session {context.session_id}",
-                level=LogLevel.INFO,
-                create_scope=False,
-            ):
-                await self._do_process(loaded_context)
+            with self._tracer.span("process", {"session_id": context.session_id}):
+                async with self._hist_engine_process_duration.measure():
+                    await self._do_process(loaded_context)
             return True
         except asyncio.CancelledError:
             return False
@@ -205,11 +216,13 @@ class AlphaEngine(Engine):
         )
 
         try:
-            with self._logger.operation(
-                f"Uttering in session {context.session_id}", create_scope=False
+            async with self._hist_engine_utter_duration.measure(
+                {"session_id": context.session_id},
             ):
-                await self._do_utter(loaded_context, requests)
+                with self._tracer.span("utter", {"session_id": context.session_id}):
+                    await self._do_utter(loaded_context, requests)
             return True
+
         except asyncio.CancelledError:
             self._logger.warning(f"Uttering in session {context.session_id} was cancelled.")
             return False
@@ -240,7 +253,7 @@ class AlphaEngine(Engine):
 
     async def _do_process(
         self,
-        context: LoadedContext,
+        context: EngineContext,
     ) -> None:
         if not await self._hooks.call_on_acknowledging(context):
             return  # Hook requested to bail out
@@ -300,21 +313,16 @@ class AlphaEngine(Engine):
                 missing_data=[p for p in problematic_data if isinstance(p, MissingToolData)],
                 invalid_data=[p for p in problematic_data if isinstance(p, InvalidToolData)],
             )
-            with CancellationSuppressionLatch() as latch:
+
+            async def uncancellable_section(
+                latch: async_utils.CancellationSuppressionLatch[None],
+            ) -> None:
                 # Money time: communicate with the customer given
                 # all of the information we have prepared.
-                message_generation_inspections = await self._generate_messages(context, latch)
+                _ = await self._generate_messages(context, latch)
 
                 # Mark that the agent is ready to receive and respond to new events.
                 await self._emit_ready_event(context)
-
-                # Save results for later inspection.
-                await self._entity_commands.create_inspection(
-                    session_id=context.session.id,
-                    correlation_id=self._correlator.correlation_id,
-                    preparation_iterations=preparation_iteration_inspections,
-                    message_generations=message_generation_inspections,
-                )
 
                 await self._add_agent_state(
                     context=context,
@@ -328,6 +336,8 @@ class AlphaEngine(Engine):
                 )
 
                 await self._hooks.call_on_messages_emitted(context)
+
+            await async_utils.latched_shield(uncancellable_section)
 
         except asyncio.CancelledError:
             # Task was cancelled. This usually happens for 1 of 2 reasons:
@@ -345,7 +355,7 @@ class AlphaEngine(Engine):
 
     async def _do_utter(
         self,
-        context: LoadedContext,
+        context: EngineContext,
         requests: Sequence[UtteranceRequest],
     ) -> None:
         try:
@@ -358,18 +368,14 @@ class AlphaEngine(Engine):
                 await self._utterance_requests_to_guideline_matches(requests)
             )
 
-            # Money time: communicate with the customer given the
-            # specified utterance requests.
-            with CancellationSuppressionLatch() as latch:
-                message_generation_inspections = await self._generate_messages(context, latch)
+            async def uncancellable_section(
+                latch: async_utils.CancellationSuppressionLatch[None],
+            ) -> None:
+                # Money time: communicate with the customer given the
+                # specified utterance requests.
+                _ = await self._generate_messages(context, latch)
 
-            # Save results for later inspection.
-            await self._entity_commands.create_inspection(
-                session_id=context.session.id,
-                correlation_id=self._correlator.correlation_id,
-                preparation_iterations=[],
-                message_generations=message_generation_inspections,
-            )
+            await async_utils.latched_shield(uncancellable_section)
 
         except asyncio.CancelledError:
             self._logger.warning("Uttering cancelled")
@@ -383,7 +389,7 @@ class AlphaEngine(Engine):
         context: Context,
         event_emitter: EventEmitter,
         load_interaction: bool = True,
-    ) -> LoadedContext:
+    ) -> EngineContext:
         # Load the full entities from storage.
 
         agent = await self._entity_queries.read_agent(context.agent_id)
@@ -398,10 +404,10 @@ class AlphaEngine(Engine):
         else:
             interaction = Interaction([])
 
-        return LoadedContext(
+        return EngineContext(
             info=context,
             logger=self._logger,
-            correlator=self._correlator,
+            tracer=self._tracer,
             agent=agent,
             customer=customer,
             session=session,
@@ -430,7 +436,7 @@ class AlphaEngine(Engine):
 
     async def _initialize_response_state(
         self,
-        context: LoadedContext,
+        context: EngineContext,
     ) -> None:
         # Load the relevant context variable values.
         context.state.context_variables = await self._load_context_variables(context)
@@ -447,10 +453,10 @@ class AlphaEngine(Engine):
 
     async def _run_preparation_iteration(
         self,
-        context: LoadedContext,
+        context: EngineContext,
         preamble_task: asyncio.Task[bool],
     ) -> _PreparationIterationResult:
-        with self._correlator.properties({"engine_iteration": len(context.state.iterations) + 1}):
+        with self._tracer.attributes({"engine_iteration": len(context.state.iterations) + 1}):
             if len(context.state.iterations) == 0:
                 # This is the first iteration, so we need to run the initial preparation iteration.
                 result = await self._run_initial_preparation_iteration(context, preamble_task)
@@ -490,7 +496,7 @@ class AlphaEngine(Engine):
 
     async def _check_if_prepared(
         self,
-        context: LoadedContext,
+        context: EngineContext,
         result: _PreparationIterationResult,
     ) -> bool:
         # If there's no new information to consider (which would have come from
@@ -512,7 +518,7 @@ class AlphaEngine(Engine):
 
     async def _run_initial_preparation_iteration(
         self,
-        context: LoadedContext,
+        context: EngineContext,
         preamble_task: asyncio.Task[bool],
     ) -> _PreparationIterationResult:
         matching_finished = False
@@ -526,9 +532,8 @@ class AlphaEngine(Engine):
             if matching_finished:
                 return
 
-            timeout = async_utils.Timeout(
-                await self._perceived_performance_policy.get_extended_processing_indicator_delay()
-            )
+            policy = self._perceived_performance_policy_provider.get_policy(context.agent.id)
+            timeout = async_utils.Timeout(await policy.get_extended_processing_indicator_delay())
 
             while not matching_finished:
                 if await timeout.wait_up_to(0.1):
@@ -550,6 +555,17 @@ class AlphaEngine(Engine):
             )
 
             matching_finished = True
+
+            # Call on_match handlers for resolved guidelines
+            handler_tasks = [
+                handler(context, match)
+                for match in guideline_and_journey_matching_result.resolved_guidelines
+                if match.guideline.id in self._hooks.guideline_match_handlers
+                for handler in self._hooks.guideline_match_handlers[match.guideline.id]
+            ]
+
+            if handler_tasks:
+                await async_utils.safe_gather(*handler_tasks)
 
             context.state.journeys = guideline_and_journey_matching_result.journeys
         finally:
@@ -668,7 +684,7 @@ class AlphaEngine(Engine):
 
     async def _run_additional_preparation_iteration(
         self,
-        context: LoadedContext,
+        context: EngineContext,
     ) -> _PreparationIterationResult:
         # For optimization concerns, it's useful to capture the exact state
         # we were in before matching guidelines.
@@ -716,7 +732,17 @@ class AlphaEngine(Engine):
             ) = tool_calling_result
 
             context.state.tool_events += new_tool_events
-            context.state.tool_insights = tool_insights
+            context.state.tool_insights = ToolInsights(
+                evaluations=list(
+                    chain(context.state.tool_insights.evaluations, tool_insights.evaluations)
+                ),
+                missing_data=list(
+                    chain(context.state.tool_insights.missing_data, tool_insights.missing_data)
+                ),
+                invalid_data=list(
+                    chain(context.state.tool_insights.invalid_data, tool_insights.invalid_data)
+                ),
+            )
 
         else:
             tool_event_generation_result = None
@@ -788,7 +814,7 @@ class AlphaEngine(Engine):
             ),
         )
 
-    async def _update_session_mode(self, context: LoadedContext) -> None:
+    async def _update_session_mode(self, context: EngineContext) -> None:
         # Do we even have control-requests coming from any called tools?
         if tool_call_control_outputs := [
             tool_call["result"]["control"]
@@ -815,18 +841,19 @@ class AlphaEngine(Engine):
                     },
                 )
 
-    async def _get_preamble_task(self, context: LoadedContext) -> asyncio.Task[bool]:
+    async def _get_preamble_task(self, context: EngineContext) -> asyncio.Task[bool]:
         async def preamble_task() -> bool:
+            policy = self._perceived_performance_policy_provider.get_policy(context.agent.id)
+
             if (
                 # Only consider a preamble in the first iteration
-                len(context.state.iterations) == 0
-                and await self._perceived_performance_policy.is_preamble_required(context)
+                len(context.state.iterations) == 0 and await policy.is_preamble_required(context)
             ):
                 if not await self._hooks.call_on_generating_preamble(context):
                     return False
 
                 await asyncio.sleep(
-                    await self._perceived_performance_policy.get_preamble_delay(context),
+                    await policy.get_preamble_delay(context),
                 )
 
                 if await self._generate_preamble(context):
@@ -840,9 +867,7 @@ class AlphaEngine(Engine):
                 # Emit a processing event to indicate that the agent is thinking
 
                 await asyncio.sleep(
-                    await self._perceived_performance_policy.get_processing_indicator_delay(
-                        context
-                    ),
+                    await policy.get_processing_indicator_delay(context),
                 )
 
                 await self._emit_processing_event(context, stage="Interpreting")
@@ -856,7 +881,7 @@ class AlphaEngine(Engine):
 
     async def _generate_preamble(
         self,
-        context: LoadedContext,
+        context: EngineContext,
     ) -> bool:
         generated_messages = False
 
@@ -870,8 +895,8 @@ class AlphaEngine(Engine):
 
     async def _generate_messages(
         self,
-        context: LoadedContext,
-        latch: CancellationSuppressionLatch,
+        context: EngineContext,
+        latch: async_utils.CancellationSuppressionLatch[None],
     ) -> Sequence[MessageGenerationInspection]:
         message_generation_inspections = []
 
@@ -897,45 +922,45 @@ class AlphaEngine(Engine):
 
         return message_generation_inspections
 
-    async def _emit_error_event(self, context: LoadedContext, exception_details: str) -> None:
+    async def _emit_error_event(self, context: EngineContext, exception_details: str) -> None:
         await context.session_event_emitter.emit_status_event(
-            correlation_id=self._correlator.correlation_id,
+            trace_id=self._tracer.trace_id,
             data={
                 "status": "error",
                 "data": {"exception": exception_details},
             },
         )
 
-    async def _emit_acknowledgement_event(self, context: LoadedContext) -> None:
+    async def _emit_acknowledgement_event(self, context: EngineContext) -> None:
         await context.session_event_emitter.emit_status_event(
-            correlation_id=self._correlator.correlation_id,
+            trace_id=self._tracer.trace_id,
             data={
                 "status": "acknowledged",
                 "data": {},
             },
         )
 
-    async def _emit_processing_event(self, context: LoadedContext, stage: str) -> None:
+    async def _emit_processing_event(self, context: EngineContext, stage: str) -> None:
         await context.session_event_emitter.emit_status_event(
-            correlation_id=self._correlator.correlation_id,
+            trace_id=self._tracer.trace_id,
             data={
                 "status": "processing",
                 "data": {"stage": stage},
             },
         )
 
-    async def _emit_cancellation_event(self, context: LoadedContext) -> None:
+    async def _emit_cancellation_event(self, context: EngineContext) -> None:
         await context.session_event_emitter.emit_status_event(
-            correlation_id=self._correlator.correlation_id,
+            trace_id=self._tracer.trace_id,
             data={
                 "status": "cancelled",
                 "data": {},
             },
         )
 
-    async def _emit_ready_event(self, context: LoadedContext) -> None:
+    async def _emit_ready_event(self, context: EngineContext) -> None:
         await context.session_event_emitter.emit_status_event(
-            correlation_id=self._correlator.correlation_id,
+            trace_id=self._tracer.trace_id,
             data={
                 "status": "ready",
                 "data": {},
@@ -961,7 +986,7 @@ class AlphaEngine(Engine):
 
     async def _load_context_variables(
         self,
-        context: LoadedContext,
+        context: EngineContext,
     ) -> list[tuple[ContextVariable, ContextVariableValue]]:
         variables_supported_by_agent = (
             await self._entity_queries.find_context_variables_for_context(
@@ -991,7 +1016,7 @@ class AlphaEngine(Engine):
         return result
 
     async def _capture_tool_preexecution_state(
-        self, context: LoadedContext
+        self, context: EngineContext
     ) -> ToolPreexecutionState:
         return await self._tool_event_generator.create_preexecution_state(
             context.session_event_emitter,
@@ -1008,7 +1033,7 @@ class AlphaEngine(Engine):
 
     async def _load_matched_guidelines_and_journeys(
         self,
-        context: LoadedContext,
+        context: EngineContext,
     ) -> _GuidelineAndJourneyMatchingResult:
         # Step 1: Retrieve the journeys likely to be activated for this agent
         sorted_journeys_by_relevance = await self._find_journeys_sorted_by_relevance(context)
@@ -1104,7 +1129,7 @@ class AlphaEngine(Engine):
 
     async def _load_additional_matched_guidelines_and_journeys(
         self,
-        context: LoadedContext,
+        context: EngineContext,
     ) -> _GuidelineAndJourneyMatchingResult:
         # Step 1: Retrieve all the possible journeys for this agent
         all_journeys = await self._entity_queries.finds_journeys_for_context(
@@ -1194,7 +1219,7 @@ class AlphaEngine(Engine):
 
     def _list_journey_paths(
         self,
-        context: LoadedContext,
+        context: EngineContext,
         guideline_matches: Sequence[GuidelineMatch],
     ) -> dict[JourneyId, list[Optional[GuidelineId]]]:
         journey_paths = copy.deepcopy(context.state.journey_paths)
@@ -1215,7 +1240,7 @@ class AlphaEngine(Engine):
 
     def _filter_activated_journeys(
         self,
-        context: LoadedContext,
+        context: EngineContext,
         match_ids: set[GuidelineId],
         all_journeys: Sequence[Journey],
     ) -> list[Journey]:
@@ -1247,7 +1272,7 @@ class AlphaEngine(Engine):
 
     async def _build_matched_guidelines(
         self,
-        context: LoadedContext,
+        context: EngineContext,
         reevaluated_guidelines: Sequence[Guideline],
         current_matched: set[GuidelineMatch],
         active_journeys: Sequence[Journey],
@@ -1369,7 +1394,7 @@ class AlphaEngine(Engine):
 
     async def _prune_low_prob_guidelines_and_all_graph(
         self,
-        context: LoadedContext,
+        context: EngineContext,
         relevant_journeys: Sequence[Journey],
         all_stored_guidelines: dict[GuidelineId, Guideline],
         top_k: int,
@@ -1442,7 +1467,7 @@ class AlphaEngine(Engine):
 
     async def _process_activated_low_probability_journey_guidelines(
         self,
-        context: LoadedContext,
+        context: EngineContext,
         all_stored_guidelines: dict[GuidelineId, Guideline],
         relevant_journeys: Sequence[Journey],
         activated_journeys: Sequence[Journey],
@@ -1482,7 +1507,7 @@ class AlphaEngine(Engine):
 
     async def _match_dependent_guidelines_and_active_journeys(
         self,
-        context: LoadedContext,
+        context: EngineContext,
         all_stored_guidelines: dict[GuidelineId, Guideline],
         already_examined_guidelines: set[GuidelineId],
         activated_journeys: Sequence[Journey],
@@ -1513,7 +1538,7 @@ class AlphaEngine(Engine):
 
         return None
 
-    async def _load_capabilities(self, context: LoadedContext) -> Sequence[Capability]:
+    async def _load_capabilities(self, context: EngineContext) -> Sequence[Capability]:
         # Capabilities are retrieved using semantic similarity.
         # The querying process is done with a text query, for which
         # the K most relevant terms are retrieved.
@@ -1533,7 +1558,7 @@ class AlphaEngine(Engine):
 
         return []
 
-    async def _load_glossary_terms(self, context: LoadedContext) -> Sequence[Term]:
+    async def _load_glossary_terms(self, context: EngineContext) -> Sequence[Term]:
         # Glossary terms are retrieved using semantic similarity.
         # The querying process is done with a text query, for which
         # the K most relevant terms are retrieved.
@@ -1570,7 +1595,7 @@ class AlphaEngine(Engine):
 
     async def _find_journeys_sorted_by_relevance(
         self,
-        context: LoadedContext,
+        context: EngineContext,
     ) -> Sequence[Journey]:
         # Journeys are retrieved using semantic similarity.
         # The querying process is done with a text query
@@ -1614,7 +1639,7 @@ class AlphaEngine(Engine):
 
     async def _call_tools(
         self,
-        context: LoadedContext,
+        context: EngineContext,
         preexecution_state: ToolPreexecutionState,
     ) -> tuple[ToolEventGenerationResult, list[EmittedEvent], ToolInsights] | None:
         result = await self._tool_event_generator.generate_events(preexecution_state, context)
@@ -1648,6 +1673,7 @@ class AlphaEngine(Engine):
                         condition="",  # FIXME: Change this to None when we support `str | None` conditions
                         action=utterance_request.action,
                     ),
+                    criticality=Criticality.MEDIUM,
                     enabled=True,
                     tags=[],
                     metadata={},
@@ -1662,7 +1688,7 @@ class AlphaEngine(Engine):
 
     async def _load_context_variable_value(
         self,
-        context: LoadedContext,
+        context: EngineContext,
         variable: ContextVariable,
         key: str,
     ) -> Optional[ContextVariableValue]:
@@ -1693,7 +1719,7 @@ class AlphaEngine(Engine):
 
     async def _add_agent_state(
         self,
-        context: LoadedContext,
+        context: EngineContext,
         session: Session,
         guideline_matches: Sequence[GuidelineMatch],
     ) -> None:
@@ -1733,11 +1759,11 @@ class AlphaEngine(Engine):
 
         await self._entity_commands.update_session(
             session_id=session.id,
-            params=SessionUpdateParams(
+            params=SessionUpdateParamsModel(
                 agent_states=list(session.agent_states)
                 + [
                     AgentState(
-                        correlation_id=self._correlator.correlation_id,
+                        trace_id=self._tracer.trace_id,
                         applied_guideline_ids=applied_guideline_ids,
                         journey_paths=context.state.journey_paths,
                     )

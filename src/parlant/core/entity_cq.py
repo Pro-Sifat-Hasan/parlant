@@ -49,14 +49,12 @@ from parlant.core.guideline_tool_associations import (
     GuidelineToolAssociationStore,
 )
 from parlant.core.glossary import GlossaryStore, Term
+from parlant.core.app_modules.sessions import SessionUpdateParamsModel
 from parlant.core.sessions import (
     SessionId,
     Session,
     SessionStore,
     Event,
-    MessageGenerationInspection,
-    PreparationIteration,
-    SessionUpdateParams,
 )
 from parlant.core.services.tools.service_registry import ServiceRegistry
 from parlant.core.tags import Tag
@@ -497,24 +495,10 @@ class EntityCommands:
         self._session_store = session_store
         self._context_variable_store = context_variable_store
 
-    async def create_inspection(
-        self,
-        session_id: SessionId,
-        correlation_id: str,
-        message_generations: Sequence[MessageGenerationInspection],
-        preparation_iterations: Sequence[PreparationIteration],
-    ) -> None:
-        await self._session_store.create_inspection(
-            session_id=session_id,
-            correlation_id=correlation_id,
-            preparation_iterations=preparation_iterations,
-            message_generations=message_generations,
-        )
-
     async def update_session(
         self,
         session_id: SessionId,
-        params: SessionUpdateParams,
+        params: SessionUpdateParamsModel,
     ) -> None:
         await self._session_store.update_session(session_id, params)
 

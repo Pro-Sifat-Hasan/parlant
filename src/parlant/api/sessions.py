@@ -20,9 +20,22 @@ from typing import Annotated, Mapping, Sequence, TypeAlias, cast
 
 
 from parlant.api.authorization import AuthorizationPolicy, Operation
-from parlant.api.common import GuidelineIdField, ExampleJson, JSONSerializableDTO, apigen_config
+from parlant.api.common import (
+    GuidelineIdField,
+    ExampleJson,
+    JSONSerializableDTO,
+    SortDirectionDTO,
+    apigen_config,
+    sort_direction_dto_to_sort_direction,
+)
 from parlant.api.glossary import TermSynonymsField, TermIdPath, TermNameField, TermDescriptionField
-from parlant.core.app_modules.sessions import Moderation
+from parlant.core.app_modules.common import decode_cursor, encode_cursor
+from parlant.core.app_modules.sessions import (
+    EventMetadataUpdateParamsModel,
+    EventUpdateParamsModel,
+    Moderation,
+    SessionUpdateParamsModel,
+)
 from parlant.core.agents import AgentId
 from parlant.core.application import Application
 from parlant.core.async_utils import Timeout
@@ -40,7 +53,6 @@ from parlant.core.sessions import (
     PreparationIteration,
     SessionId,
     SessionStatus,
-    SessionUpdateParams,
 )
 from parlant.core.canned_responses import CannedResponseId
 
@@ -174,6 +186,14 @@ SessionModeField: TypeAlias = Annotated[
     ),
 ]
 
+SessionMetadataField: TypeAlias = Annotated[
+    Mapping[str, JSONSerializableDTO],
+    Field(
+        description="Metadata for the session",
+        examples=[{"simulation": True, "priority": "high"}],
+    ),
+]
+
 
 session_example: ExampleJson = {
     "id": "sess_123yz",
@@ -183,6 +203,7 @@ session_example: ExampleJson = {
     "title": "Product inquiry session",
     "mode": "auto",
     "consumption_offsets": consumption_offsets_example,
+    "metadata": {"simulation": True, "priority": "high"},
 }
 
 
@@ -199,12 +220,21 @@ class SessionDTO(
     title: SessionTitleField | None = None
     mode: SessionModeField
     consumption_offsets: ConsumptionOffsetsDTO
+    metadata: SessionMetadataField
+
+
+class SessionListingDTO(DefaultBaseModel):
+    """Paginated response for sessions"""
+
+    items: Sequence[SessionDTO]
+    total_count: int
+    has_more: bool
+    next_cursor: str | None = None
 
 
 SessionCreationParamsCustomerIdField: TypeAlias = Annotated[
     CustomerId | None,
     Field(
-        default=None,
         description=" ID of the customer this session belongs to. If not provided, a guest customer will be created.",
         examples=[None, "cust_123xy"],
     ),
@@ -215,6 +245,7 @@ session_creation_params_example: ExampleJson = {
     "agent_id": "ag_123xyz",
     "customer_id": "cust_123xy",
     "title": "Product inquiry session",
+    "metadata": {"project": "demo", "priority": "high"},
 }
 
 
@@ -227,6 +258,7 @@ class SessionCreationParamsDTO(
     agent_id: SessionAgentIdPath
     customer_id: SessionCreationParamsCustomerIdField = None
     title: SessionTitleField | None = None
+    metadata: SessionMetadataField | None = None
 
 
 message_example = "Hello, I need help with my order"
@@ -294,6 +326,15 @@ class ParticipantDTO(DefaultBaseModel):
     display_name: ParticipantDisplayNameField
 
 
+EventMetadataField: TypeAlias = Annotated[
+    Mapping[str, JSONSerializableDTO],
+    Field(
+        description="Metadata associated with the event",
+        examples=[{"key1": "value1", "key2": 2}],
+    ),
+]
+
+
 class EventCreationParamsDTO(
     DefaultBaseModel,
     json_schema_extra={"example": event_creation_params_example},
@@ -304,6 +345,7 @@ class EventCreationParamsDTO(
     source: EventSourceDTO
     message: SessionEventCreationParamsMessageField | None = None
     data: JSONSerializableDTO | None = None
+    metadata: EventMetadataField | None = None
     guidelines: list[AgentMessageGuidelineDTO] | None = None
     participant: ParticipantDTO | None = None
     status: SessionStatusDTO | None = None
@@ -331,12 +373,21 @@ EventCreationUTCField: TypeAlias = Annotated[
     Field(description="UTC timestamp of when the event was created"),
 ]
 
-
 EventCorrelationIdField: TypeAlias = Annotated[
     str,
     Field(
+        deprecated=True,
         description="ID linking related events together",
         examples=["corr_13xyz"],
+    ),
+]
+
+
+EventTraceIdField: TypeAlias = Annotated[
+    str,
+    Field(
+        description="ID linking related events together",
+        examples=["trace_13xyz"],
     ),
 ]
 
@@ -346,7 +397,7 @@ event_example: ExampleJson = {
     "kind": "message",
     "offset": 0,
     "creation_utc": "2024-03-24T12:00:00Z",
-    "correlation_id": "corr_13xyz",
+    "trace_id": "corr_13xyz",
     "data": {
         "message": "Hello, I need help with my account",
         "participant": {"id": "cust_123xy", "display_name": "John Doe"},
@@ -365,8 +416,10 @@ class EventDTO(
     kind: EventKindDTO
     offset: EventOffsetField
     creation_utc: EventCreationUTCField
+    trace_id: EventTraceIdField
     correlation_id: EventCorrelationIdField
     data: JSONSerializableDTO
+    metadata: EventMetadataField
     deleted: bool
 
 
@@ -379,9 +432,65 @@ class ConsumptionOffsetsUpdateParamsDTO(
     client: ConsumptionOffsetClientField | None = None
 
 
+SessionMetadataUnsetField: TypeAlias = Annotated[
+    Sequence[str],
+    Field(
+        description="Metadata keys to remove from the session",
+        examples=[["simulation", "priority"]],
+    ),
+]
+
+session_metadata_update_params_example: ExampleJson = {
+    "set": {
+        "simulation": False,
+        "priority": "low",
+    },
+    "unset": ["simulation", "priority"],
+}
+
+
+class SessionMetadataUpdateParamsDTO(
+    DefaultBaseModel,
+    json_schema_extra={"example": session_metadata_update_params_example},
+):
+    """Parameters for updating a session's metadata."""
+
+    set: SessionMetadataField | None = None
+    unset: SessionMetadataUnsetField | None = None
+
+
+event_update_params_example: ExampleJson = {
+    "metadata": {
+        "set": {
+            "priority": "high",
+            "category": "support",
+            "agent_id": "agent_123",
+        },
+        "unset": ["old_priority"],
+    }
+}
+
+
+class EventUpdateParamsDTO(
+    DefaultBaseModel,
+    json_schema_extra={"example": event_update_params_example},
+):
+    """Parameters for updating an event.
+
+    Currently only supports updating metadata, but designed to be extensible
+    for future event property updates.
+    """
+
+    metadata: SessionMetadataUpdateParamsDTO | None = None
+
+
 session_update_params_example: ExampleJson = {
     "title": "Updated session title",
     "consumption_offsets": {"client": 42},
+    "metadata": {
+        "set": {"simulation": True, "priority": "low"},
+        "unset": ["old_project"],
+    },
 }
 
 
@@ -396,6 +505,7 @@ class SessionUpdateParamsDTO(
     mode: SessionModeField | None = None
     customer_id: CustomerId | None = None
     agent_id: AgentId | None = None
+    metadata: SessionMetadataUpdateParamsDTO | None = None
 
 
 ToolResultDataField: TypeAlias = Annotated[
@@ -990,8 +1100,10 @@ def event_to_dto(event: Event) -> EventDTO:
         kind=_event_kind_to_event_kind_dto(event.kind),
         offset=event.offset,
         creation_utc=event.creation_utc,
-        correlation_id=event.correlation_id,
+        trace_id=event.trace_id,
+        correlation_id=event.trace_id,
         data=cast(JSONSerializableDTO, event.data),
+        metadata=event.metadata,
         deleted=event.deleted,
     )
 
@@ -1125,7 +1237,7 @@ MinOffsetQuery: TypeAlias = Annotated[
     ),
 ]
 
-CorrelationIdQuery: TypeAlias = Annotated[
+TraceIdQuery: TypeAlias = Annotated[
     str,
     Query(
         description="ID linking related events together",
@@ -1133,11 +1245,47 @@ CorrelationIdQuery: TypeAlias = Annotated[
     ),
 ]
 
+CorrelationIdQuery: TypeAlias = Annotated[
+    str,
+    Query(
+        deprecated=True,
+        description="ID linking related events together",
+        examples=["corr_13xyz"],
+    ),
+]
+
+
 KindsQuery: TypeAlias = Annotated[
     str,
     Query(
         description="If set, only list events of the specified kinds (separated by commas)",
         examples=["message,tool", "message,status"],
+    ),
+]
+
+LimitQuery: TypeAlias = Annotated[
+    int,
+    Query(
+        description="Maximum number of items to return",
+        ge=1,
+        le=100,
+        examples=[10, 25],
+    ),
+]
+
+CursorQuery: TypeAlias = Annotated[
+    str,
+    Query(
+        description="Pagination cursor for fetching the next page of results",
+        examples=["AAABjnBU9gBl/0BQt1axI0VniQI="],
+    ),
+]
+
+SortQuery: TypeAlias = Annotated[
+    SortDirectionDTO,
+    Query(
+        description="Sort direction for results",
+        examples=["asc", "desc"],
     ),
 ]
 
@@ -1243,7 +1391,7 @@ def create_router(
                 "description": "Session successfully created. Returns the complete session object.",
                 "content": {"application/json": {"example": session_example}},
             },
-            status.HTTP_422_UNPROCESSABLE_ENTITY: {
+            status.HTTP_422_UNPROCESSABLE_CONTENT: {
                 "description": "Validation error in request parameters"
             },
         },
@@ -1274,6 +1422,7 @@ def create_router(
             agent_id=params.agent_id,
             title=params.title,
             allow_greeting=allow_greeting,
+            metadata=params.metadata or {},
         )
 
         return SessionDTO(
@@ -1284,6 +1433,7 @@ def create_router(
             consumption_offsets=ConsumptionOffsetsDTO(client=session.consumption_offsets["client"]),
             title=session.title,
             mode=SessionModeDTO(session.mode),
+            metadata=session.metadata,
         )
 
     @router.get(
@@ -1318,19 +1468,32 @@ def create_router(
                 client=session.consumption_offsets["client"],
             ),
             mode=SessionModeDTO(session.mode),
+            metadata=session.metadata,
         )
 
     @router.get(
         "",
         operation_id="list_sessions",
-        response_model=Sequence[SessionDTO],
+        response_model=SessionListingDTO | Sequence[SessionDTO],
         responses={
             status.HTTP_200_OK: {
-                "description": "List of all matching sessions",
-                "content": {"application/json": {"example": [session_example]}},
+                "description": (
+                    "If a limit is provided, a paginated list of sessions will be returned. "
+                    "Otherwise, the full list of sessions will be returned."
+                ),
+                "content": {
+                    "application/json": {
+                        "example": {
+                            "items": [session_example],
+                            "total_count": 1,
+                            "has_more": False,
+                            "next_cursor": None,
+                        }
+                    }
+                },
             },
-            status.HTTP_422_UNPROCESSABLE_ENTITY: {
-                "description": "Validation error in request parameters"
+            status.HTTP_422_UNPROCESSABLE_CONTENT: {
+                "description": "Validation error in the request parameters."
             },
         },
         **apigen_config(group_name=API_GROUP, method_name="list"),
@@ -1339,32 +1502,63 @@ def create_router(
         request: Request,
         agent_id: AgentIdQuery | None = None,
         customer_id: CustomerIdQuery | None = None,
-    ) -> Sequence[SessionDTO]:
-        """Lists all sessions matching the specified filters.
+        limit: LimitQuery | None = None,
+        cursor: CursorQuery | None = None,
+        sort: SortQuery | None = None,
+    ) -> SessionListingDTO | Sequence[SessionDTO]:
+        """Lists all sessions matching the specified filters with pagination support.
 
-        Can filter by agent_id and/or customer_id. Returns all sessions if no
-        filters are provided."""
+        Can filter by agent_id and/or customer_id. Supports cursor-based pagination
+        with configurable sort direction."""
         await authorization_policy.authorize(request=request, operation=Operation.LIST_SESSIONS)
 
-        sessions = await app.sessions.find(
+        sessions_result = await app.sessions.find(
             agent_id=agent_id,
             customer_id=customer_id,
+            limit=limit,
+            cursor=decode_cursor(cursor) if cursor else None,
+            sort_direction=sort_direction_dto_to_sort_direction(sort) if sort else None,
         )
 
-        return [
-            SessionDTO(
-                id=s.id,
-                agent_id=s.agent_id,
-                creation_utc=s.creation_utc,
-                title=s.title,
-                customer_id=s.customer_id,
-                consumption_offsets=ConsumptionOffsetsDTO(
-                    client=s.consumption_offsets["client"],
-                ),
-                mode=SessionModeDTO(s.mode),
-            )
-            for s in sessions
-        ]
+        if limit is None:
+            return [
+                SessionDTO(
+                    id=s.id,
+                    agent_id=s.agent_id,
+                    creation_utc=s.creation_utc,
+                    title=s.title,
+                    customer_id=s.customer_id,
+                    consumption_offsets=ConsumptionOffsetsDTO(
+                        client=s.consumption_offsets["client"],
+                    ),
+                    mode=SessionModeDTO(s.mode),
+                    metadata=s.metadata,
+                )
+                for s in sessions_result.items
+            ]
+
+        return SessionListingDTO(
+            items=[
+                SessionDTO(
+                    id=s.id,
+                    agent_id=s.agent_id,
+                    creation_utc=s.creation_utc,
+                    title=s.title,
+                    customer_id=s.customer_id,
+                    consumption_offsets=ConsumptionOffsetsDTO(
+                        client=s.consumption_offsets["client"],
+                    ),
+                    mode=SessionModeDTO(s.mode),
+                    metadata=s.metadata,
+                )
+                for s in sessions_result.items
+            ],
+            total_count=sessions_result.total_count,
+            has_more=sessions_result.has_more,
+            next_cursor=encode_cursor(sessions_result.next_cursor)
+            if sessions_result.next_cursor
+            else None,
+        )
 
     @router.delete(
         "/{session_id}",
@@ -1395,7 +1589,7 @@ def create_router(
             status.HTTP_204_NO_CONTENT: {
                 "description": "All matching sessions successfully deleted"
             },
-            status.HTTP_422_UNPROCESSABLE_ENTITY: {
+            status.HTTP_422_UNPROCESSABLE_CONTENT: {
                 "description": "Validation error in request parameters"
             },
         },
@@ -1412,12 +1606,12 @@ def create_router(
         filters are provided."""
         await authorization_policy.authorize(request=request, operation=Operation.DELETE_SESSIONS)
 
-        sessions = await app.sessions.find(
+        sessions_result = await app.sessions.find(
             agent_id=agent_id,
             customer_id=customer_id,
         )
 
-        for s in sessions:
+        for s in sessions_result.items:
             await app.sessions.delete(s.id)
 
     @router.patch(
@@ -1426,7 +1620,7 @@ def create_router(
         responses={
             status.HTTP_200_OK: {"description": "Session successfully updated"},
             status.HTTP_404_NOT_FOUND: {"description": "Session not found"},
-            status.HTTP_422_UNPROCESSABLE_ENTITY: {
+            status.HTTP_422_UNPROCESSABLE_CONTENT: {
                 "description": "Validation error in update parameters"
             },
         },
@@ -1442,8 +1636,8 @@ def create_router(
         Only provided attributes will be updated; others remain unchanged."""
         await authorization_policy.authorize(request=request, operation=Operation.UPDATE_SESSION)
 
-        async def from_dto(dto: SessionUpdateParamsDTO) -> SessionUpdateParams:
-            params: SessionUpdateParams = {}
+        async def from_dto(dto: SessionUpdateParamsDTO) -> SessionUpdateParamsModel:
+            params: SessionUpdateParamsModel = {}
 
             if dto.consumption_offsets:
                 session = await app.sessions.read(session_id)
@@ -1466,6 +1660,19 @@ def create_router(
             if dto.agent_id:
                 params["agent_id"] = dto.agent_id
 
+            if dto.metadata:
+                session = await app.sessions.read(session_id)
+                current_metadata = dict(session.metadata)
+
+                if dto.metadata.set:
+                    current_metadata.update(dto.metadata.set)
+
+                if dto.metadata.unset:
+                    for key in dto.metadata.unset:
+                        current_metadata.pop(key, None)
+
+                params["metadata"] = current_metadata
+
             return params
 
         session = await app.sessions.update(session_id=session_id, params=await from_dto(params))
@@ -1480,6 +1687,7 @@ def create_router(
                 client=session.consumption_offsets["client"],
             ),
             mode=SessionModeDTO(session.mode),
+            metadata=session.metadata,
         )
 
     @router.post(
@@ -1493,7 +1701,7 @@ def create_router(
                 "content": {"application/json": {"example": event_example}},
             },
             status.HTTP_404_NOT_FOUND: {"description": "Session not found"},
-            status.HTTP_422_UNPROCESSABLE_ENTITY: {
+            status.HTTP_422_UNPROCESSABLE_CONTENT: {
                 "description": "Validation error in event parameters"
             },
         },
@@ -1534,7 +1742,7 @@ def create_router(
                 return await _add_human_agent_message_on_behalf_of_ai_agent(session_id, params)
             else:
                 raise HTTPException(
-                    status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+                    status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
                     detail='Only "customer", "human_agent", and "human_agent_on_behalf_of_ai_agent" sources are supported for direct posting.',
                 )
 
@@ -1552,7 +1760,7 @@ def create_router(
 
         else:
             raise HTTPException(
-                status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+                status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
                 detail="Only message, custom and status events can currently be added manually",
             )
 
@@ -1577,14 +1785,14 @@ def create_router(
 
         if params.status is None:
             raise HTTPException(
-                status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+                status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
                 detail='Missing "status" field for status event',
             )
 
         raw_data = params.data or {}
         if not isinstance(raw_data, dict):
             raise HTTPException(
-                status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+                status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
                 detail='Status event "data" must be a JSON object',
             )
 
@@ -1592,6 +1800,7 @@ def create_router(
             session_id=session_id,
             status=status_dto_to_status(params.status),
             data=raw_data,
+            metadata=params.metadata,
             source=_event_source_dto_to_event_source(params.source),
         )
 
@@ -1604,7 +1813,7 @@ def create_router(
     ) -> EventDTO:
         if not params.message:
             raise HTTPException(
-                status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+                status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
                 detail="Missing 'message' field for event",
             )
 
@@ -1612,6 +1821,7 @@ def create_router(
             session_id=session_id,
             moderation=_moderation_dto_to_moderation(moderation),
             message=params.message,
+            metadata=params.metadata,
             source=EventSource.CUSTOMER,
             trigger_processing=True,
         )
@@ -1624,7 +1834,7 @@ def create_router(
     ) -> EventDTO:
         if params.message:
             raise HTTPException(
-                status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+                status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
                 detail="If you add an agent message, you cannot specify what the message will be, as it will be auto-generated by the agent.",
             )
 
@@ -1644,12 +1854,12 @@ def create_router(
     ) -> EventDTO:
         if not params.message:
             raise HTTPException(
-                status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+                status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
                 detail="Missing 'message' field for event",
             )
         if not params.participant or not params.participant.display_name:
             raise HTTPException(
-                status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+                status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
                 detail="Missing 'participant' with 'display_name' for human agent message",
             )
 
@@ -1657,6 +1867,7 @@ def create_router(
             session_id=session_id,
             message=params.message,
             participant=_participant_dto_to_participant(params.participant),
+            metadata=params.metadata,
         )
 
         return event_to_dto(event)
@@ -1667,13 +1878,14 @@ def create_router(
     ) -> EventDTO:
         if not params.message:
             raise HTTPException(
-                status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+                status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
                 detail="Missing 'data' field for message",
             )
 
         event = await app.sessions.create_human_agent_on_behalf_of_ai_agent_message_event(
             session_id=session_id,
             message=params.message,
+            metadata=params.metadata,
         )
 
         return EventDTO(
@@ -1682,8 +1894,10 @@ def create_router(
             kind=_event_kind_to_event_kind_dto(event.kind),
             offset=event.offset,
             creation_utc=event.creation_utc,
-            correlation_id=event.correlation_id,
+            trace_id=event.trace_id,
+            correlation_id=event.trace_id,
             data=cast(JSONSerializableDTO, event.data),
+            metadata=event.metadata,
             deleted=event.deleted,
         )
 
@@ -1693,7 +1907,7 @@ def create_router(
     ) -> EventDTO:
         if not params.data:
             raise HTTPException(
-                status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+                status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
                 detail="Missing 'data' field for custom event",
             )
 
@@ -1701,6 +1915,7 @@ def create_router(
             session_id=session_id,
             kind=_event_kind_dto_to_event_kind(params.kind),
             data=params.data,
+            metadata=params.metadata,
             source=_event_source_dto_to_event_source(params.source),
             trigger_processing=False,
         )
@@ -1711,8 +1926,10 @@ def create_router(
             kind=_event_kind_to_event_kind_dto(event.kind),
             offset=event.offset,
             creation_utc=event.creation_utc,
-            correlation_id=event.correlation_id,
+            trace_id=event.trace_id,
+            correlation_id=event.trace_id,
             data=cast(JSONSerializableDTO, event.data),
+            metadata=event.metadata,
             deleted=event.deleted,
         )
 
@@ -1728,7 +1945,7 @@ def create_router(
             status.HTTP_404_NOT_FOUND: {
                 "description": "Session not found",
             },
-            status.HTTP_422_UNPROCESSABLE_ENTITY: {
+            status.HTTP_422_UNPROCESSABLE_CONTENT: {
                 "description": "Validation error in request parameters"
             },
             status.HTTP_504_GATEWAY_TIMEOUT: {
@@ -1743,13 +1960,14 @@ def create_router(
         min_offset: MinOffsetQuery | None = None,
         source: EventSourceDTO | None = None,
         correlation_id: CorrelationIdQuery | None = None,
+        trace_id: TraceIdQuery | None = None,
         kinds: KindsQuery | None = None,
         wait_for_data: int = 60,
     ) -> Sequence[EventDTO]:
         """Lists events from a session with optional filtering and waiting capabilities.
 
         This endpoint retrieves events from a specified session and can:
-        1. Filter events by their offset, source, type, and correlation ID
+        1. Filter events by their offset, source, type, and trace ID
         2. Wait for new events to arrive if requested
         3. Return events in chronological order based on their offset
 
@@ -1777,7 +1995,7 @@ def create_router(
                 min_offset=min_offset or 0,
                 source=event_source,
                 kinds=kind_list,
-                correlation_id=correlation_id,
+                trace_id=trace_id,
                 timeout=Timeout(wait_for_data),
             ):
                 raise HTTPException(
@@ -1790,7 +2008,7 @@ def create_router(
             min_offset=min_offset or 0,
             source=event_source,
             kinds=kind_list,
-            correlation_id=correlation_id,
+            trace_id=trace_id,
         )
 
         return [
@@ -1800,8 +2018,10 @@ def create_router(
                 kind=_event_kind_to_event_kind_dto(e.kind),
                 offset=e.offset,
                 creation_utc=e.creation_utc,
-                correlation_id=e.correlation_id,
+                trace_id=e.trace_id,
+                correlation_id=e.trace_id,
                 data=cast(JSONSerializableDTO, e.data),
+                metadata=e.metadata,
                 deleted=e.deleted,
             )
             for e in events
@@ -1814,7 +2034,7 @@ def create_router(
         responses={
             status.HTTP_204_NO_CONTENT: {"description": "Events successfully deleted"},
             status.HTTP_404_NOT_FOUND: {"description": "Session not found"},
-            status.HTTP_422_UNPROCESSABLE_ENTITY: {
+            status.HTTP_422_UNPROCESSABLE_CONTENT: {
                 "description": "Validation error in request parameters"
             },
         },
@@ -1833,6 +2053,54 @@ def create_router(
         try:
             await app.sessions.delete_events(session_id=session_id, min_offset=min_offset)
         except ValueError as e:
-            raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail=f"{e}")
+            raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_CONTENT, detail=f"{e}")
+
+    @router.patch(
+        "/{session_id}/events/{event_id}",
+        operation_id="update_event",
+        response_model=EventDTO,
+        responses={
+            status.HTTP_200_OK: {
+                "description": "Event successfully updated",
+                "content": {"application/json": {"example": event_example}},
+            },
+            status.HTTP_404_NOT_FOUND: {"description": "Session or event not found"},
+            status.HTTP_422_UNPROCESSABLE_CONTENT: {
+                "description": "Validation error in update parameters"
+            },
+        },
+        **apigen_config(group_name=API_GROUP, method_name="update_event"),
+    )
+    async def update_event(
+        request: Request,
+        session_id: SessionIdPath,
+        event_id: EventIdPath,
+        params: EventUpdateParamsDTO,
+    ) -> EventDTO:
+        """Updates an event's properties.
+
+        Currently only supports updating metadata. Other event properties cannot be modified.
+        This API is designed to be extensible for future event property updates.
+        """
+        await authorization_policy.authorize(request=request, operation=Operation.UPDATE_EVENT)
+
+        update_params: EventUpdateParamsModel = {}
+        if params.metadata is not None:
+            # Convert API DTO to app_modules model - pass through set/unset operations
+            metadata_update: EventMetadataUpdateParamsModel = {}
+            if params.metadata.set:
+                metadata_update["set"] = params.metadata.set
+            if params.metadata.unset:
+                metadata_update["unset"] = params.metadata.unset
+
+            update_params["metadata"] = metadata_update
+
+        event = await app.sessions.update_event(
+            session_id=session_id,
+            event_id=event_id,
+            params=update_params,
+        )
+
+        return event_to_dto(event)
 
     return router

@@ -68,8 +68,9 @@ await agent.create_guideline(
 ```
 
 - ✅ [Blog: How Parlant Ensures Agent Compliance](https://www.parlant.io/blog/how-parlant-guarantees-compliance)
+- 🆚 [Blog: Parlant vs LangGraph](https://www.parlant.io/blog/parlant-vs-langgraph)
 - 🆚 [Blog: Parlant vs DSPy](https://www.parlant.io/blog/parlant-vs-dspy)
-
+- ⚙️ [Blog: Inside Parlant's Guideline Matching Engine](https://www.parlant.io/blog/inside-parlant-guideline-matching-engine)
 
 #### Parlant gives you all the structure you need to build customer-facing agents that behave exactly as your business requires:
 

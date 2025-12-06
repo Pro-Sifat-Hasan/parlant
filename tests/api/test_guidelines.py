@@ -102,6 +102,66 @@ async def test_that_a_guideline_can_be_created_without_an_action(
     assert guideline["action"] is None
 
 
+async def test_that_a_guideline_can_be_created_with_custom_id(
+    async_client: httpx.AsyncClient,
+) -> None:
+    """Test that a guideline can be created with a custom ID."""
+    custom_id = "custom-guideline-id-456"
+
+    response = await async_client.post(
+        "/guidelines",
+        json={
+            "id": custom_id,
+            "condition": "the customer mentions a custom requirement",
+            "action": "provide personalized assistance",
+        },
+    )
+
+    assert response.status_code == status.HTTP_201_CREATED
+
+    guideline = response.json()
+
+    # Verify that the custom ID was used
+    assert guideline["id"] == custom_id
+    assert guideline["condition"] == "the customer mentions a custom requirement"
+    assert guideline["action"] == "provide personalized assistance"
+    assert guideline["enabled"] is True
+    assert guideline["tags"] == []
+    assert guideline["metadata"] == {}
+
+
+async def test_that_creating_guideline_with_duplicate_id_fails(
+    async_client: httpx.AsyncClient,
+) -> None:
+    """Test that creating a guideline with a duplicate ID fails appropriately."""
+    custom_id = "duplicate-guideline-id"
+
+    # Create first guideline
+    response1 = await async_client.post(
+        "/guidelines",
+        json={
+            "id": custom_id,
+            "condition": "first condition",
+            "action": "first action",
+        },
+    )
+    assert response1.status_code == status.HTTP_201_CREATED
+
+    # Try to create second guideline with same ID
+    response2 = await async_client.post(
+        "/guidelines",
+        json={
+            "id": custom_id,
+            "condition": "second condition",
+            "action": "second action",
+        },
+    )
+
+    # Should fail due to duplicate ID
+    assert response2.status_code == status.HTTP_422_UNPROCESSABLE_CONTENT
+    assert "already exists" in response2.text
+
+
 async def test_that_a_guideline_can_be_created_with_tags(
     async_client: httpx.AsyncClient,
     container: Container,
@@ -735,3 +795,163 @@ async def test_that_guideline_with_relationships_can_be_deleted(
 
     response = await async_client.get(f"/guidelines/{guideline.id}")
     assert response.status_code == status.HTTP_404_NOT_FOUND
+
+
+async def test_that_a_guideline_can_be_created_with_description(
+    async_client: httpx.AsyncClient,
+) -> None:
+    response = await async_client.post(
+        "/guidelines",
+        json={
+            "condition": "the customer asks about premium features",
+            "action": "explain the premium features available",
+            "description": "Premium features are only available to customers with active subscriptions",
+            "enabled": True,
+        },
+    )
+
+    assert response.status_code == status.HTTP_201_CREATED
+
+    guideline = response.json()
+    assert guideline["condition"] == "the customer asks about premium features"
+    assert guideline["action"] == "explain the premium features available"
+    assert (
+        guideline["description"]
+        == "Premium features are only available to customers with active subscriptions"
+    )
+    assert guideline["enabled"] is True
+
+    guideline_id = guideline["id"]
+    item = (await async_client.get(f"/guidelines/{guideline_id}")).raise_for_status().json()
+
+    assert item["guideline"]["id"] == guideline_id
+    assert (
+        item["guideline"]["description"]
+        == "Premium features are only available to customers with active subscriptions"
+    )
+
+
+async def test_that_a_guideline_description_can_be_updated(
+    async_client: httpx.AsyncClient,
+    container: Container,
+) -> None:
+    guideline_store = container[GuidelineStore]
+
+    guideline = await guideline_store.create_guideline(
+        condition="the customer asks about refunds",
+        action="explain the refund policy",
+        metadata={},
+    )
+
+    response = await async_client.patch(
+        f"/guidelines/{guideline.id}",
+        json={
+            "description": "Refunds are only available within 30 days of purchase",
+        },
+    )
+
+    assert response.status_code == status.HTTP_200_OK
+    updated_guideline = response.json()["guideline"]
+
+    assert updated_guideline["id"] == guideline.id
+    assert (
+        updated_guideline["description"] == "Refunds are only available within 30 days of purchase"
+    )
+
+
+async def test_that_a_guideline_description_can_be_updated_to_none(
+    async_client: httpx.AsyncClient,
+    container: Container,
+) -> None:
+    guideline_store = container[GuidelineStore]
+
+    guideline = await guideline_store.create_guideline(
+        condition="the customer asks about shipping",
+        action="explain shipping options",
+        metadata={},
+    )
+
+    response = await async_client.patch(
+        f"/guidelines/{guideline.id}",
+        json={
+            "description": None,
+        },
+    )
+
+    assert response.status_code == status.HTTP_200_OK
+    updated_guideline = response.json()["guideline"]
+
+    assert updated_guideline["id"] == guideline.id
+    assert updated_guideline["description"] is None
+
+
+async def test_that_guideline_can_be_created_with_criticality_via_api(
+    async_client: httpx.AsyncClient,
+) -> None:
+    response = await async_client.post(
+        "/guidelines",
+        json={
+            "condition": "Customer reports a critical security issue",
+            "action": "Escalate to security team immediately",
+            "criticality": "high",
+        },
+    )
+
+    assert response.status_code == status.HTTP_201_CREATED
+
+    guideline = response.json()
+    assert guideline["condition"] == "Customer reports a critical security issue"
+    assert guideline["action"] == "Escalate to security team immediately"
+    assert guideline["criticality"] == "high"
+
+
+async def test_that_guideline_defaults_to_medium_criticality_via_api(
+    async_client: httpx.AsyncClient,
+) -> None:
+    response = await async_client.post(
+        "/guidelines",
+        json={
+            "condition": "Customer asks about product features",
+            "action": "Provide detailed feature information",
+        },
+    )
+
+    assert response.status_code == status.HTTP_201_CREATED
+
+    guideline = response.json()
+    assert guideline["condition"] == "Customer asks about product features"
+    assert guideline["action"] == "Provide detailed feature information"
+    assert guideline["criticality"] == "medium"
+
+
+async def test_that_guideline_criticality_can_be_updated_via_api(
+    async_client: httpx.AsyncClient,
+    container: Container,
+) -> None:
+    # Create a guideline with LOW criticality
+    create_response = await async_client.post(
+        "/guidelines",
+        json={
+            "condition": "Customer has a minor question",
+            "action": "Provide basic information",
+            "criticality": "low",
+        },
+    )
+
+    assert create_response.status_code == status.HTTP_201_CREATED
+    guideline = create_response.json()
+    guideline_id = guideline["id"]
+
+    # Update criticality to HIGH
+    update_response = await async_client.patch(
+        f"/guidelines/{guideline_id}",
+        json={
+            "criticality": "high",
+        },
+    )
+
+    assert update_response.status_code == status.HTTP_200_OK
+    updated_guideline = update_response.json()["guideline"]
+
+    assert updated_guideline["id"] == guideline_id
+    assert updated_guideline["criticality"] == "high"

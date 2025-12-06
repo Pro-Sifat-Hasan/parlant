@@ -45,7 +45,9 @@ API_GROUP = "context-variables"
 
 FreshnessRulesField: TypeAlias = Annotated[
     str,
-    Field(default=None, description="Cron expression defining the freshness rules"),
+    Field(
+        description="Cron expression defining the freshness rules",
+    ),
 ]
 
 ContextVariableIdPath: TypeAlias = Annotated[
@@ -298,7 +300,7 @@ class ContextVariableUpdateParamsDTO(
                 croniter(value)
             except Exception:
                 raise HTTPException(
-                    status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+                    status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
                     detail="the provided freshness_rules. contain an invalid cron expression.",
                 )
         return value
@@ -343,7 +345,7 @@ class ContextVariableCreationParamsDTO(
                 croniter(value)
             except Exception:
                 raise HTTPException(
-                    status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+                    status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
                     detail="the provided freshness_rules. contain an invalid cron expression.",
                 )
         return value
@@ -366,7 +368,7 @@ def create_router(
                 "content": common.example_json_content(context_variable_example),
             },
             status.HTTP_404_NOT_FOUND: {"description": "Tool not found"},
-            status.HTTP_422_UNPROCESSABLE_ENTITY: {
+            status.HTTP_422_UNPROCESSABLE_CONTENT: {
                 "description": "Validation error in request parameters"
             },
         },
@@ -422,7 +424,7 @@ def create_router(
                 "content": common.example_json_content(context_variable_example),
             },
             status.HTTP_404_NOT_FOUND: {"description": "Variable not found"},
-            status.HTTP_422_UNPROCESSABLE_ENTITY: {
+            status.HTTP_422_UNPROCESSABLE_CONTENT: {
                 "description": "Validation error in request parameters"
             },
         },
@@ -663,7 +665,7 @@ def create_router(
                 "content": common.example_json_content(context_variable_value_example),
             },
             status.HTTP_404_NOT_FOUND: {"description": "Variable, agent, or key not found"},
-            status.HTTP_422_UNPROCESSABLE_ENTITY: {
+            status.HTTP_422_UNPROCESSABLE_CONTENT: {
                 "description": "Validation error in request parameters"
             },
         },

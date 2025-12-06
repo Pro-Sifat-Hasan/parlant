@@ -16,12 +16,13 @@ from __future__ import annotations
 from dataclasses import dataclass
 from datetime import datetime
 from typing import Optional, Sequence, cast
+from typing_extensions import deprecated
 
 from parlant.core.agents import Agent
 from parlant.core.capabilities import Capability
 from parlant.core.common import JSONSerializable
 from parlant.core.context_variables import ContextVariable, ContextVariableValue
-from parlant.core.contextual_correlator import ContextualCorrelator
+from parlant.core.tracer import Tracer
 from parlant.core.customers import Customer
 from parlant.core.emissions import EmittedEvent, EventEmitter
 from parlant.core.engines.alpha.guideline_matching.guideline_match import GuidelineMatch
@@ -63,8 +64,8 @@ class InteractionMessage:
     participant: Participant
     """The participant who sent the message (includes display name and ID)"""
 
-    correlation_id: str
-    """The correlation ID of the message"""
+    trace_id: str
+    """The trace ID of the message"""
 
     content: str
     """The content of the message"""
@@ -96,7 +97,7 @@ class Interaction:
             InteractionMessage(
                 source=event.source,
                 participant=cast(MessageEventData, event.data)["participant"],
-                correlation_id=event.correlation_id,
+                trace_id=event.trace_id,
                 content=cast(MessageEventData, event.data)["message"],
                 creation_utc=event.creation_utc,
             )
@@ -107,17 +108,26 @@ class Interaction:
     @property
     def last_customer_message(self) -> Optional[InteractionMessage]:
         """Returns the last customer message in the interaction session, if it exists"""
+        if event := self.last_customer_message_event:
+            message_data = cast(MessageEventData, event.data)
+
+            return InteractionMessage(
+                source=event.source,
+                participant=message_data["participant"],
+                trace_id=event.trace_id,
+                content=message_data["message"],
+                creation_utc=event.creation_utc,
+            )
+
+        return None
+
+    @property
+    def last_customer_message_event(self) -> Optional[Event]:
+        """Returns the last customer message in the interaction session, if it exists"""
         for event in reversed(self.history):
             if event.kind == EventKind.MESSAGE and event.source == EventSource.CUSTOMER:
-                message_data = cast(MessageEventData, event.data)
+                return event
 
-                return InteractionMessage(
-                    source=event.source,
-                    participant=message_data["participant"],
-                    correlation_id=event.correlation_id,
-                    content=message_data["message"],
-                    creation_utc=event.creation_utc,
-                )
         return None
 
     history: Sequence[Event]
@@ -159,7 +169,7 @@ class ResponseState:
 
 
 @dataclass
-class LoadedContext:
+class EngineContext:
     """Helper class to access loaded values that are relevant for responding in a particular context"""
 
     info: Context
@@ -168,8 +178,13 @@ class LoadedContext:
     logger: Logger
     """The logger used to log messages in the current context"""
 
-    correlator: ContextualCorrelator
-    """The correlator used to track the correlation ID and properties in the current context"""
+    tracer: Tracer
+    """The tracer used to track the trace ID and properties in the current context"""
+
+    @property
+    @deprecated("Use the tracer property instead")
+    def correlator(self) -> Tracer:
+        return self.tracer
 
     agent: Agent
     """The agent which is currently requested to respond"""
@@ -203,7 +218,7 @@ class LoadedContext:
             EmittedEvent(
                 source=EventSource.SYSTEM,
                 kind=EventKind.TOOL,
-                correlation_id=self.correlator.correlation_id,
+                trace_id=self.tracer.trace_id,
                 data=cast(
                     JSONSerializable,
                     ToolEventData(
@@ -223,5 +238,11 @@ class LoadedContext:
                         ]
                     ),
                 ),
+                metadata=None,
             )
         )
+
+
+@deprecated("Please use the EngineContext class instead of LoadedContext")
+class LoadedContext(EngineContext):
+    pass

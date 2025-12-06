@@ -40,8 +40,9 @@ class Shot:
             kind=EventKind.MESSAGE,
             creation_utc=datetime.now(timezone.utc),  # unused in shots
             offset=0,  # unused in shots
-            correlation_id="<unused>",  # unused in shots
+            trace_id="<unused>",  # unused in shots
             data=cast(JSONSerializable, data),
+            metadata={},  # unused in shots
             deleted=False,
         )
 
@@ -53,8 +54,9 @@ class Shot:
             kind=EventKind.TOOL,
             creation_utc=datetime.now(timezone.utc),  # unused in shots
             offset=0,  # unused in shots
-            correlation_id="<unused>",  # unused in shots
+            trace_id="<unused>",  # unused in shots
             data=cast(JSONSerializable, data),
+            metadata={},  # unused in shots
             deleted=False,
         )
 

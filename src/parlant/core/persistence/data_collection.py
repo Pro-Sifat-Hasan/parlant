@@ -7,11 +7,10 @@ from typing_extensions import override
 
 from parlant.core.async_utils import safe_gather
 from parlant.core.common import generate_id
-from parlant.core.contextual_correlator import ContextualCorrelator
+from parlant.core.tracer import Tracer
 from parlant.core.engines.alpha.prompt_builder import PromptBuilder
 from parlant.core.nlp.generation import T, SchematicGenerationResult, SchematicGenerator
 from parlant.core.nlp.tokenization import EstimatingTokenizer
-from parlant.core.sessions import Session
 
 
 class DataCollectingSchematicGenerator(SchematicGenerator[T]):
@@ -20,10 +19,10 @@ class DataCollectingSchematicGenerator(SchematicGenerator[T]):
     def __init__(
         self,
         wrapped_generator: SchematicGenerator[T],
-        correlator: ContextualCorrelator,
+        tracer: Tracer,
     ) -> None:
         self._wrapped_generator = wrapped_generator
-        self._correlator = correlator
+        self._tracer = tracer
 
         if path := os.environ.get("PARLANT_DATA_COLLECTION_PATH"):
             self._base_path = Path(path)
@@ -40,17 +39,17 @@ class DataCollectingSchematicGenerator(SchematicGenerator[T]):
 
         path = self._base_path
 
-        if scope := self._correlator.get("scope"):
-            path = path / scope
+        if scope := self._tracer.get_attribute("scope"):
+            path = path / cast(str, scope)
 
-        if self._correlator.get("session"):
-            session = cast(Session, self._correlator.get("session"))
-            path = path / f"Session_{session.id}"
+        if self._tracer.get_attribute("session_id"):
+            session_id = self._tracer.get_attribute("session_id")
+            path = path / f"Session_{session_id}"
 
-        if request_id := self._correlator.get("request_id"):
+        if request_id := self._tracer.get_attribute("request_id"):
             path = path / f"R{request_id}"
 
-        if iteration := self._correlator.get("engine_iteration"):
+        if iteration := self._tracer.get_attribute("engine_iteration"):
             path = path / f"Iteration_{iteration}"
 
         path.mkdir(parents=True, exist_ok=True)
@@ -67,9 +66,9 @@ class DataCollectingSchematicGenerator(SchematicGenerator[T]):
             prompt = prompt.build()
 
         async with (
-            aiofiles.open(prompt_path, "w") as prompt_file,
-            aiofiles.open(completion_path, "w") as completion_file,
-            aiofiles.open(usage_path, "w") as usage_file,
+            aiofiles.open(prompt_path, "w", encoding="utf-8") as prompt_file,
+            aiofiles.open(completion_path, "w", encoding="utf-8") as completion_file,
+            aiofiles.open(usage_path, "w", encoding="utf-8") as usage_file,
         ):
             usage_info = json.dumps(
                 {

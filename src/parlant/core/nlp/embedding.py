@@ -15,6 +15,7 @@
 from abc import ABC, abstractmethod
 from collections.abc import Mapping
 from dataclasses import dataclass
+from datetime import datetime, timezone
 import hashlib
 import json
 from lagom import Container
@@ -22,6 +23,8 @@ from typing import Any, Callable, Optional, Sequence, TypedDict, cast
 from typing_extensions import override
 
 from parlant.core.common import Version
+from parlant.core.loggers import Logger
+from parlant.core.meter import DurationHistogram, Meter
 from parlant.core.nlp.tokenization import EstimatingTokenizer, ZeroEstimatingTokenizer
 from parlant.core.persistence.common import ObjectId
 from parlant.core.persistence.document_database import (
@@ -65,6 +68,47 @@ class Embedder(ABC):
     def dimensions(self) -> int: ...
 
 
+_EMBED_DURATION_HISTOGRAM: DurationHistogram | None = None
+
+
+class BaseEmbedder(Embedder):
+    def __init__(self, logger: Logger, meter: Meter, model_name: str) -> None:
+        self.logger = logger
+        self.meter = meter
+        self.model_name = model_name
+
+        global _EMBED_DURATION_HISTOGRAM
+        if _EMBED_DURATION_HISTOGRAM is None:
+            _EMBED_DURATION_HISTOGRAM = meter.create_duration_histogram(
+                name="embed",
+                description="Duration of embedding requests in milliseconds",
+            )
+
+    @abstractmethod
+    async def do_embed(
+        self,
+        texts: list[str],
+        hints: Mapping[str, Any] = {},
+    ) -> EmbeddingResult: ...
+
+    @override
+    async def embed(
+        self,
+        texts: list[str],
+        hints: Mapping[str, Any] = {},
+    ) -> EmbeddingResult:
+        if _EMBED_DURATION_HISTOGRAM is not None:
+            async with _EMBED_DURATION_HISTOGRAM.measure(
+                {
+                    "class.name": self.__class__.__qualname__,
+                    "embedding.model.name": self.model_name,
+                },
+            ):
+                return await self.do_embed(texts, hints)
+        else:
+            return await self.do_embed(texts, hints)
+
+
 class EmbedderFactory:
     """Factory for creating embedder instances."""
 
@@ -72,14 +116,14 @@ class EmbedderFactory:
         self._container = container
 
     def create_embedder(self, embedder_type: type[Embedder]) -> Embedder:
-        if embedder_type == NoOpEmbedder:
-            return NoOpEmbedder()
+        if embedder_type == NullEmbedder:
+            return NullEmbedder()
         else:
             return self._container[embedder_type]
 
 
-class NoOpEmbedder(Embedder):
-    """A no-op embedder that returns zero vectors."""
+class NullEmbedder(Embedder):
+    """A null embedder that returns zero vectors."""
 
     def __init__(self) -> None:
         self._tokenizer = ZeroEstimatingTokenizer()
@@ -112,8 +156,15 @@ class NoOpEmbedder(Embedder):
         return 1536  # Standard embedding dimension
 
 
+class EmbedderResultDocument_v0_1_0(TypedDict, total=False):
+    id: ObjectId
+    version: Version.String
+    vectors: Sequence[Sequence[float]]
+
+
 class EmbedderResultDocument(TypedDict, total=False):
     id: ObjectId
+    creation_utc: str
     version: Version.String
     vectors: Sequence[Sequence[float]]
 
@@ -147,7 +198,7 @@ EmbeddingCacheProvider = Callable[[], EmbeddingCache]
 class BasicEmbeddingCache(EmbeddingCache):
     """A basic embedding cache that uses a document database to store results."""
 
-    VERSION = Version.from_string("0.1.0")
+    VERSION = Version.from_string("0.2.0")
 
     def __init__(
         self,
@@ -158,7 +209,17 @@ class BasicEmbeddingCache(EmbeddingCache):
 
     async def _document_loader(self, doc: BaseDocument) -> Optional[EmbedderResultDocument]:
         if doc["version"] == "0.1.0":
+            d = cast(EmbedderResultDocument_v0_1_0, doc)
+            return EmbedderResultDocument(
+                id=d["id"],
+                creation_utc=datetime.now(timezone.utc).isoformat(),
+                version=d["version"],
+                vectors=d["vectors"],
+            )
+
+        if doc["version"] == "0.2.0":
             return cast(EmbedderResultDocument, doc)
+
         return None
 
     async def _get_or_create_collection(
@@ -191,6 +252,7 @@ class BasicEmbeddingCache(EmbeddingCache):
     ) -> EmbedderResultDocument:
         return EmbedderResultDocument(
             id=ObjectId(id),
+            creation_utc=datetime.now(timezone.utc).isoformat(),
             version=self.VERSION.to_string(),
             vectors=vectors,
         )

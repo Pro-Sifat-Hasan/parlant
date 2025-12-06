@@ -23,7 +23,7 @@ import httpx
 from typing_extensions import Literal
 
 from parlant.core.async_utils import ReaderWriterLock
-from parlant.core.contextual_correlator import ContextualCorrelator
+from parlant.core.tracer import Tracer
 from parlant.core.emissions import EventEmitterFactory
 from parlant.core.loggers import Logger
 from parlant.core.nlp.moderation import ModerationService
@@ -98,7 +98,7 @@ class ServiceRegistry(ABC):
     ) -> None: ...
 
 
-class _ToolServiceDocument(TypedDict, total=False):
+class _ToolServiceDocument_v0_1_0(TypedDict, total=False):
     id: ObjectId
     version: Version.String
     name: str
@@ -107,15 +107,25 @@ class _ToolServiceDocument(TypedDict, total=False):
     source: Optional[str]
 
 
+class _ToolServiceDocument(TypedDict, total=False):
+    id: ObjectId
+    creation_utc: str
+    version: Version.String
+    name: str
+    kind: ToolServiceKind
+    url: str
+    source: Optional[str]
+
+
 class ServiceDocumentRegistry(ServiceRegistry):
-    VERSION = Version.from_string("0.1.0")
+    VERSION = Version.from_string("0.2.0")
 
     def __init__(
         self,
         database: DocumentDatabase,
         event_emitter_factory: EventEmitterFactory,
         logger: Logger,
-        correlator: ContextualCorrelator,
+        tracer: Tracer,
         nlp_services_provider: Callable[[], Mapping[str, NLPService]],
         allow_migration: bool = False,
     ):
@@ -124,7 +134,7 @@ class ServiceDocumentRegistry(ServiceRegistry):
 
         self._event_emitter_factory = event_emitter_factory
         self._logger = logger
-        self._correlator = correlator
+        self._tracer = tracer
 
         self._nlp_services_provider = nlp_services_provider
         self._nlp_services: Mapping[str, NLPService]
@@ -253,14 +263,14 @@ class ServiceDocumentRegistry(ServiceRegistry):
                 url=document["url"],
                 event_emitter_factory=self._event_emitter_factory,
                 logger=self._logger,
-                correlator=self._correlator,
+                tracer=self._tracer,
             )
         elif document["kind"] == "mcp":
             return MCPToolClient(
                 url=document["url"],
                 event_emitter_factory=self._event_emitter_factory,
                 logger=self._logger,
-                correlator=self._correlator,
+                tracer=self._tracer,
             )
         else:
             raise ValueError("Unsupported ToolService kind.")
@@ -290,14 +300,14 @@ class ServiceDocumentRegistry(ServiceRegistry):
                     url=url,
                     event_emitter_factory=self._event_emitter_factory,
                     logger=self._logger,
-                    correlator=self._correlator,
+                    tracer=self._tracer,
                 )
             elif kind == "sdk":
                 service = PluginClient(
                     url=url,
                     event_emitter_factory=self._event_emitter_factory,
                     logger=self._logger,
-                    correlator=self._correlator,
+                    tracer=self._tracer,
                 )
             else:
                 raise ValueError(f"Unsupported ToolService kind: {kind}")

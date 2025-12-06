@@ -21,7 +21,7 @@ from pytest import fixture
 
 from parlant.core.agents import Agent
 from parlant.core.capabilities import Capability
-from parlant.core.common import JSONSerializable, generate_id
+from parlant.core.common import Criticality, JSONSerializable, generate_id
 from parlant.core.context_variables import (
     ContextVariable,
     ContextVariableId,
@@ -34,7 +34,7 @@ from parlant.core.engines.alpha.guideline_matching.generic.disambiguation_batch 
     DisambiguationGuidelineMatchesSchema,
     GenericDisambiguationGuidelineMatchingBatch,
 )
-from parlant.core.engines.alpha.guideline_matching.guideline_matcher import (
+from parlant.core.engines.alpha.guideline_matching.guideline_matching_context import (
     GuidelineMatchingContext,
 )
 from parlant.core.engines.alpha.optimization_policy import OptimizationPolicy
@@ -43,6 +43,7 @@ from parlant.core.glossary import Term, TermId
 from parlant.core.guidelines import Guideline, GuidelineContent, GuidelineId
 from parlant.core.journeys import JourneyStore
 from parlant.core.loggers import Logger
+from parlant.core.meter import Meter
 from parlant.core.nlp.generation import SchematicGenerator
 from parlant.core.services.indexing.behavioral_change_evaluation import GuidelineEvaluator
 from parlant.core.sessions import EventSource, Session
@@ -157,6 +158,10 @@ GUIDELINES_DICT = {
         "condition": "The customer asks to start a FixFlow session",
         "action": "start a FixFlow session",
     },
+    "scheduling_journey": {
+        "condition": "The patient wants to schedule an appointment",
+    },
+    "lab_results_journey": {"condition": "The patient wants to see their lab results"},
 }
 
 CONDITION_HEAD_DICT = {
@@ -166,6 +171,7 @@ CONDITION_HEAD_DICT = {
     "cancel_flight": "The customer if asks to make a change in booked flight but doesn’t specify whether they want to reschedule, request a refund, or fully cancel the booking",
     "fix_bug": "The customer has a technical problem, and they didn't specify what kind of help they want to have",
     "suspicious_transaction": "The user suspects fraud but it's not clear whether they want to dispute a transaction or lock a card.",
+    "healthcare_inquiry": "The patient asks to follow up on their visit, but it's not clear in which way",
 }
 
 
@@ -189,13 +195,16 @@ def create_context_variable(
 ) -> tuple[ContextVariable, ContextVariableValue]:
     return ContextVariable(
         id=ContextVariableId("-"),
+        creation_utc=datetime.now(timezone.utc),
         name=name,
         description="",
         tool_id=None,
         freshness_rules=None,
         tags=tags,
     ), ContextVariableValue(
-        ContextVariableValueId("-"), last_modified=datetime.now(timezone.utc), data=data
+        ContextVariableValueId("-"),
+        last_modified=datetime.now(timezone.utc),
+        data=data,
     )
 
 
@@ -233,6 +242,7 @@ async def create_guideline(
             condition=condition,
             action=action,
         ),
+        criticality=Criticality.MEDIUM,
         enabled=True,
         tags=tags,
         metadata=metadata,
@@ -249,7 +259,7 @@ async def create_guideline_by_name(
         guideline = await create_guideline(
             context=context,
             condition=GUIDELINES_DICT[guideline_name]["condition"],
-            action=GUIDELINES_DICT[guideline_name]["action"],
+            action=GUIDELINES_DICT[guideline_name].get("action", None),
         )
     else:
         guideline = None
@@ -315,6 +325,7 @@ async def base_test_that_ambiguity_detected_with_relevant_guidelines(
 
     disambiguation_resolver = GenericDisambiguationGuidelineMatchingBatch(
         logger=context.logger,
+        meter=context.container[Meter],
         journey_store=context.container[JourneyStore],
         optimization_policy=context.container[OptimizationPolicy],
         schematic_generator=context.schematic_generator,
@@ -856,6 +867,47 @@ async def test_that_ambiguity_is_not_detected_when_clarification_was_asked_and_c
     ]
     disambiguating_guidelines: list[str] = []
     head_condition = CONDITION_HEAD_DICT["suspicious_transaction"]
+    await base_test_that_ambiguity_detected_with_relevant_guidelines(
+        context,
+        agent,
+        new_session,
+        customer,
+        conversation_context,
+        head_condition,
+        is_ambiguous=False,
+        to_disambiguate_guidelines_names=to_disambiguate_guidelines,
+        disambiguating_guideline_names=disambiguating_guidelines,
+    )
+
+
+async def test_that_ambiguity_is_not_detected_on_clear_request_1(
+    context: ContextOfTest,
+    agent: Agent,
+    new_session: Session,
+    customer: Customer,
+) -> None:
+    conversation_context: list[tuple[EventSource, str]] = [
+        (
+            EventSource.CUSTOMER,
+            "Hello there.",
+        ),
+        (
+            EventSource.AI_AGENT,
+            "Hello.",
+        ),
+        (
+            EventSource.AI_AGENT,
+            "How can I assist you today?",
+        ),
+        (
+            EventSource.CUSTOMER,
+            "I need to book an appointment with my doctor,",
+        ),
+    ]
+
+    to_disambiguate_guidelines = ["scheduling_journey", "lab_results_journey"]
+    disambiguating_guidelines: list[str] = []
+    head_condition = CONDITION_HEAD_DICT["healthcare_inquiry"]
     await base_test_that_ambiguity_detected_with_relevant_guidelines(
         context,
         agent,
